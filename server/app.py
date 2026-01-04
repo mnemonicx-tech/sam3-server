@@ -20,9 +20,12 @@ def startup_event():
     try:
         # prefer the local checkpoint if available
         model_wrapper.load_model(model_path="models/sam3.pt", device="cpu", half=False)
+        print("✓ SAM3 model loaded successfully")
     except Exception as e:
         # store error so endpoints can return a helpful message
-        app.state.model_error = str(e)
+        error_msg = str(e)
+        app.state.model_error = error_msg
+        print(f"✗ Model loading failed: {error_msg}")
 
 
 @app.post("/infer")

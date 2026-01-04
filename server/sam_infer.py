@@ -29,6 +29,7 @@ class ModelWrapper:
         except Exception as e:
             # Enter mock mode when ultralytics or dependencies are not available.
             # This allows local development and endpoint testing without heavy weights.
+            print(f"[ModelWrapper] Warning: ultralytics not available, entering mock mode: {e}")
             self.predictor = None
             self.mock = True
             return
@@ -48,7 +49,12 @@ class ModelWrapper:
             overrides.setdefault("model", model_path)
 
         # create predictor instance
-        self.predictor = SAM3SemanticPredictor(overrides=overrides)
+        try:
+            self.predictor = SAM3SemanticPredictor(overrides=overrides)
+            print(f"[ModelWrapper] SAM3 model loaded from {model_path}")
+        except Exception as e:
+            print(f"[ModelWrapper] Error loading SAM3 from {model_path}: {e}")
+            raise
 
     def set_image(self, image_input: bytes | str):
         """Accept bytes or a file path. If bytes, write to a temp file and pass path to predictor."""
@@ -67,12 +73,13 @@ class ModelWrapper:
         if self.predictor is None and not getattr(self, "mock", False):
             raise RuntimeError("Model not loaded; call load_model() before set_image()")
 
-        # call predictor.set_image; some implementations accept path or array
-        try:
-            self.predictor.set_image(path)
-        except Exception:
-            # fallback: try passing path anyway
-            self.predictor.set_image(path)
+        # call predictor.set_image only if predictor is not None
+        if self.predictor is not None:
+            try:
+                self.predictor.set_image(path)
+            except Exception:
+                # fallback: try passing path anyway
+                self.predictor.set_image(path)
 
         # record last image path; dimensions may be available on predictor or can be resolved lazily
         self.image_path = path
@@ -198,146 +205,6 @@ class ModelWrapper:
             import traceback
             traceback.print_exc()
             masks_out = [{"mask_id": "0", "error": str(e)}]
-
-        return masks_out
-            masks_out: List[dict] = []
-            w = self.image_width or 256
-            h = self.image_height or 256
-            for i, t in enumerate(texts or ["concept"]):
-                # center box covering 50% of short edge
-                bw = int(w * 0.5)
-                bh = int(h * 0.5)
-                x0 = (w - bw) // 2
-                y0 = (h - bh) // 2
-                x1 = x0 + bw
-                y1 = y0 + bh
-                masks_out.append({
-                    "mask_id": str(i),
-                    "score": 1.0,
-                    "bbox": [x0, y0, x1, y1],
-                    "rle": None,
-                    "png_base64": None,
-                    "area": bw * bh,
-                    "raw": f"mock mask for '{t}'",
-                })
-            return masks_out
-
-        # call predictor
-        options_in = options
-        try:
-            raw = self.predictor(text=texts)
-        except TypeError:
-            raw = self.predictor(texts)
-
-        masks_out: List[dict] = []
-        try:
-            import numpy as _np
-            import base64, io
-            from PIL import Image as _Image
-
-            def _extract_score(r_obj):
-                # Try multiple common fields for confidence/probability
-                candidates = [
-                    getattr(r_obj, "probs", None),
-                    getattr(r_obj, "scores", None),
-                    getattr(r_obj, "confs", None),
-                    getattr(r_obj, "confidence", None),
-                    None,
-                ]
-                # also check boxes.conf
-                try:
-                    bconf = getattr(r_obj, "boxes", None)
-                    if bconf is not None:
-                        c = getattr(bconf, "conf", None) or getattr(bconf, "confidence", None)
-                        if c is not None:
-                            candidates.insert(0, c)
-                except Exception:
-                    pass
-
-                for cand in candidates:
-                    if cand is None:
-                        continue
-                    try:
-                        arr = cand.cpu().numpy() if hasattr(cand, "cpu") else _np.array(cand)
-                        if getattr(arr, "size", None) and arr.size:
-                            # return first score
-                            return float(arr.flat[0])
-                    except Exception:
-                        try:
-                            return float(cand)
-                        except Exception:
-                            continue
-                return None
-
-            # raw may be an iterable of Results or a single Results
-            iter_results = raw if isinstance(raw, (list, tuple)) else [raw]
-            for i, r in enumerate(iter_results):
-                entry: dict[str, object] = {"mask_id": str(i)}
-
-                # try to extract bbox
-                try:
-                    if hasattr(r, "boxes") and r.boxes is not None:
-                        xyxy = getattr(r.boxes, "xyxy", None) or getattr(r.boxes, "xyxyn", None)
-                        if xyxy is not None:
-                            arr = xyxy.cpu().numpy() if hasattr(xyxy, "cpu") else _np.array(xyxy)
-                            if arr.size:
-                                b = arr[0].tolist()
-                                entry["bbox"] = [int(b[0]), int(b[1]), int(b[2]), int(b[3])]
-                except Exception:
-                    pass
-
-                # extract score if available
-                try:
-                    score_val = _extract_score(r)
-                    if score_val is not None:
-                        entry["score"] = score_val
-                except Exception:
-                    pass
-
-                # try to extract masks
-                try:
-                    if hasattr(r, "masks") and r.masks is not None:
-                        mdata = getattr(r.masks, "data", None) or getattr(r.masks, "masks", None)
-                        if mdata is None:
-                            mdata = r.masks
-                        if mdata is not None:
-                            m_arr = None
-                            if hasattr(mdata, "cpu"):
-                                try:
-                                    m_arr = mdata.cpu().numpy()
-                                except Exception:
-                                    m_arr = None
-                            if m_arr is None:
-                                try:
-                                    m_arr = _np.array(mdata)
-                                except Exception:
-                                    m_arr = None
-
-                            if m_arr is not None:
-                                if m_arr.ndim == 2:
-                                    masks = m_arr[None, ...]
-                                else:
-                                    masks = m_arr
-                                mask0 = (masks[0].astype("uint8") * 255) if masks.dtype == bool else masks[0].astype("uint8")
-                                img = _Image.fromarray(mask0)
-                                buf = io.BytesIO()
-                                img.save(buf, format="PNG")
-                                entry["png_base64"] = base64.b64encode(buf.getvalue()).decode("ascii")
-                                entry["area"] = int((mask0 > 0).sum())
-                except Exception:
-                    pass
-
-                # fallback raw repr if nothing parsed
-                if "bbox" not in entry and "png_base64" not in entry and "raw" not in entry and "score" not in entry:
-                    try:
-                        entry["raw"] = repr(r)
-                    except Exception:
-                        entry["raw"] = str(type(r))
-
-                masks_out.append(entry)
-        except Exception:
-            # worst-case fallback
-            masks_out = [{"mask_id": "0", "raw": repr(raw)}]
 
         return masks_out
 
