@@ -1,0 +1,19 @@
+{
+  "request_id": "3af9e5f8-9798-44c6-a3cf-954dc5db5257",
+  "image_size": {
+    "width": 1290,
+    "height": 1274
+  },
+  "masks": [
+    {
+      "mask_id": "0",
+      "score": null,
+      "bbox": null,
+      "rle": null,
+      "png_base64": null,
+      "area": null,
+      "raw": "ultralytics.engine.results.Results object with attributes:\n\nboxes: ultralytics.engine.results.Boxes object\nkeypoints: None\nmasks: None\nnames: ['segment a shirt']\nobb: None\norig_img: array([[[  0,   0,   0],\n        [  0,   0,   0],\n        [  0,   0,   0],\n        ...,\n        [ 32,  52,  74],\n        [ 31,  51,  78],\n        [ 28,  48,  74]],\n\n       [[  0,   0,   0],\n        [  0,   0,   0],\n        [  0,   0,   0],\n        ...,\n        [ 29,  50,  72],\n        [ 27,  47,  73],\n        [ 27,  45,  69]],\n\n       [[  0,   0,   0],\n        [  0,   0,   0],\n        [  0,   0,   0],\n        ...,\n        [ 28,  48,  70],\n        [ 25,  44,  69],\n        [ 27,  45,  67]],\n\n       ...,\n\n       [[  0,   0,   0],\n        [  0,   0,   0],\n        [  0,   0,   0],\n        ...,\n        [159, 151, 127],\n        [159, 151, 127],\n        [159, 151, 127]],\n\n       [[  0,   0,   0],\n        [  0,   0,   0],\n        [  0,   0,   0],\n        ...,\n        [159, 150, 128],\n        [159, 150, 128],\n        [159, 150, 128]],\n\n       [[  0,   0,   0],\n        [  0,   0,   0],\n        [  0,   0,   0],\n        ...,\n        [158, 150, 127],\n        [158, 150, 127],\n        [159, 151, 127]]], shape=(1274, 1290, 3), dtype=uint8)\norig_shape: (1274, 1290)\npath: '/var/folders/gv/xjbjc5rd1k1558kz4jffk6q80000gn/T/tmpzba8lwfu.jpg'\nprobs: None\nsave_dir: '/Users/kishankumar/Documents/Makeover/SAM3/runs/segment/predict'\nspeed: {'preprocess': 2.322624990483746, 'inference': 9963.720959000057, 'postprocess': 1.8209580157417804}"
+    }
+  ],
+  "processing_time_ms": 0.0
+}

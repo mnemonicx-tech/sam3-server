@@ -1,0 +1,8 @@
+[project]
+name = "sam3-server"
+version = "0.1.0"
+description = "SAM3 inference server scaffold"
+requires-python = ">=3.10"
+
+[tool.poetry.dependencies]
+python = ">=3.10"

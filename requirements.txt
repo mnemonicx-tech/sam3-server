@@ -1,0 +1,9 @@
+fastapi>=0.95
+uvicorn>=0.22
+python-multipart
+pillow
+numpy
+ultralytics
+boto3
+pytest
+pytest-asyncio
