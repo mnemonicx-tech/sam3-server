@@ -80,7 +80,6 @@ def main():
         # BUT we specified '/opt/ml/input/data' in destination.
         
         # We need to ensure environment variables are set if our script uses them
-        arguments=[]
     )
 
     print("✅ Processing Job Completed")
