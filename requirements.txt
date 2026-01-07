@@ -7,3 +7,8 @@ ultralytics
 boto3
 pytest
 pytest-asyncio
+
+# Added for SageMaker deployment
+torch
+sagemaker
+sagemaker-inference

@@ -1,0 +1,21 @@
+1. Navigate to the AWS Management Console
+
+2. Search for and open the 'Service Quotas' console
+
+3. In the Service Quotas console, search for 'Amazon Elastic Compute Cloud (Amazon EC2)'
+
+4. Look for the quota named 'Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances'
+
+5. Click on the 'Request increase' button for this quota
+
+6. In the 'Increase quota value' field, specify a new vCPU limit greater than 0
+
+7. Provide a brief explanation in the 'Justification' section for why you need more vCPUs
+
+8. Submit the request by clicking on the 'Submit request' button
+
+9. Wait for the approval of your request
+
+10. If you need urgent assistance, navigate to the AWS Support Center at https://support.console.aws.amazon.com/support/home
+
+11. Once your quota increase is approved, return to the EC2 console and attempt to launch your instance again
