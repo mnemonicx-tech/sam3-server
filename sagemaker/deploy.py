@@ -36,7 +36,12 @@ def main():
         base_job_name=JOB_NAME_PREFIX,
         sagemaker_session=sm_session,
         # Ensure we can use GPU
-        volume_size_in_gb=50, 
+        volume_size_in_gb=50,
+        env={
+            "INPUT_ROOT": "/opt/ml/input/data",
+            "OUTPUT_ROOT": "/opt/ml/output/data",
+            "SAM_CHECKPOINT": "/opt/ml/model/sam3.pt"
+        } 
     )
 
     print("🔹 Starting Processing Job...")
@@ -75,13 +80,7 @@ def main():
         # BUT we specified '/opt/ml/input/data' in destination.
         
         # We need to ensure environment variables are set if our script uses them
-        arguments=[], 
-        # env variables can be passed here if needed
-        env={
-            "INPUT_ROOT": "/opt/ml/input/data",
-            "OUTPUT_ROOT": "/opt/ml/output/data",
-            "SAM_CHECKPOINT": "/opt/ml/model/sam3.pt" # Points to the file inside the mounted dir
-        }
+        arguments=[]
     )
 
     print("✅ Processing Job Completed")
