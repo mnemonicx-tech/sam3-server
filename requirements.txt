@@ -11,4 +11,5 @@ pytest-asyncio
 # Added for SageMaker deployment
 torch
 sagemaker
-sagemaker-inference
+wget
+git+https://github.com/IDEA-Research/GroundingDINO.git

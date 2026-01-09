@@ -7,6 +7,23 @@ import cv2
 import torch
 import numpy as np
 from segment_anything import sam_model_registry, SamPredictor
+import wget
+from PIL import Image
+
+# Grounding DINO imports
+import groundingdino.datasets.transforms as T
+from groundingdino.models import build_model
+from groundingdino.util.slconfig import SLConfig
+from groundingdino.util.utils import clean_state_dict
+
+# ------------- GroundingDINO Defaults -------------
+GD_CONFIG_PATH = "GroundingDINO_SwinT_OGC.py" # Keep it simple in CWD or handle download
+GD_WEIGHTS_PATH = "groundingdino_swint_ogc.pth"
+GD_WEIGHTS_URL = "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
+GD_CONFIG_URL = "https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+
+BOX_THRESHOLD = 0.35
+TEXT_THRESHOLD = 0.25
 
 # ------------- Defaults -------------
 DEFAULT_MODEL_PATH = "./models/sam3.pt"
@@ -47,7 +64,49 @@ def list_images(folder: str):
             yield f
 
 
-def load_prompts(prompts_path: str) -> dict:
+def load_grounding_dino():
+    # Only download if missing
+    if not os.path.exists(GD_CONFIG_PATH):
+        print(f"⬇️ Downloading GroundingDINO config from {GD_CONFIG_URL}...")
+        wget.download(GD_CONFIG_URL, GD_CONFIG_PATH)
+    
+    if not os.path.exists(GD_WEIGHTS_PATH):
+        print(f"⬇️ Downloading GroundingDINO weights from {GD_WEIGHTS_URL}...")
+        wget.download(GD_WEIGHTS_URL, GD_WEIGHTS_PATH)
+        
+    print(f"🔹 Loading GroundingDINO...")
+    args = SLConfig.fromfile(GD_CONFIG_PATH)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    args.device = device
+    model = build_model(args)
+    checkpoint = torch.load(GD_WEIGHTS_PATH, map_location="cpu")
+    model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+    model.eval()
+    return model.to(device)
+
+
+def transform_image_for_gd(image_pil):
+    transform = T.Compose([
+        T.RandomResize([800], max_size=1333),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    image, _ = transform(image_pil, None)
+    return image
+
+
+def get_boxes_from_text(model, image, caption, box_threshold, text_threshold, device):
+    with torch.no_grad():
+        outputs = model(image[None].to(device), captions=[caption])
+    
+    logits = outputs["pred_logits"].cpu().sigmoid()[0]  # (nq, 256)
+    boxes = outputs["pred_boxes"].cpu()[0]  # (nq, 4)
+
+    # Filter by threshold
+    filt_mask = logits.max(dim=1)[0] > box_threshold
+    boxes_filt = boxes[filt_mask]
+    
+    return boxes_filt
     if not os.path.exists(prompts_path):
         raise FileNotFoundError(f"❌ prompts.json not found: {prompts_path}")
     with open(prompts_path, "r", encoding="utf-8") as f:
@@ -100,13 +159,12 @@ def main():
         print(f"⬇️ Syncing input from: {s3_uri}")
         run(f"aws s3 sync {s3_uri} {args.input} --no-progress")
 
-    # ---------------- Load model ----------------
-    torch.set_grad_enabled(False)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-
+    # ---------------- Load models ----------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"✅ Device: {device}")
+
+    print("🚀 Loading GroundingDINO model...")
+    gd_model = load_grounding_dino()
 
     print("🚀 Loading SAM model...")
     sam = sam_model_registry["vit_h"](checkpoint=args.model)
@@ -137,26 +195,64 @@ def main():
                 stats.skipped += 1
                 continue
 
-            image = cv2.imread(img_path)
-            if image is None:
+            # Load image
+            image_cv = cv2.imread(img_path)
+            if image_cv is None:
+                continue
+            
+            # Prepare image for SAM (RGB)
+            image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+            
+            # Prepare image for GroundingDINO (PIL -> Tensor)
+            image_pil = Image.fromarray(image_rgb)
+            image_gd_tensor = transform_image_for_gd(image_pil)
+            
+            # 1. GroundingDINO: Text -> Boxes
+            boxes_filt = get_boxes_from_text(gd_model, image_gd_tensor, prompt, BOX_THRESHOLD, TEXT_THRESHOLD, device)
+            
+            if len(boxes_filt) == 0:
+                # No object found matching prompt
                 continue
 
-            image = resize_image(image, args.max_res)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # Convert boxes (cx, cy, w, h) norm -> (x1, y1, x2, y2) pixel
+            H, W = image_rgb.shape[:2]
+            boxes_xyxy = boxes_filt * torch.Tensor([W, H, W, H])
+            boxes_xyxy[:, :2] -= boxes_xyxy[:, 2:] / 2
+            boxes_xyxy[:, 2:] += boxes_xyxy[:, :2]
 
-            predictor.set_image(image)
+            # 2. SAM: Image + Boxes -> Mask
+            # We resize for SAM after getting boxes? 
+            # Actually efficient way: Resize first? 
+            # Note: The original script resized first. But DINO needs original quality usually.
+            # Let's keep original resolution for DINO detection, then pass to SAM.
+            # SAM handles resizing internally usually via predictor.set_image.
+            # If we want to use the resized logic from before, we need to resize boxes too.
+            # For simplicity and accuracy, let's use original resolution (SAM is heavy but fits on A4000).
+            # If OOM, we can resize. A4000 has 16GB. 1024x1024 is fine.
+            
+            predictor.set_image(image_rgb)
+            
+            transformed_boxes = predictor.transform.apply_boxes_torch(boxes_xyxy.to(device), image_rgb.shape[:2])
 
             with torch.cuda.amp.autocast(dtype=torch.float16):
-                masks, _, _ = predictor.predict(
+                masks, _, _ = predictor.predict_torch(
                     point_coords=None,
                     point_labels=None,
-                    box=None,
-                    text_prompt=prompt,
+                    boxes=transformed_boxes, # Use all boxes
                     multimask_output=False,
                 )
+            
+            # Combine masks if multiple boxes found (e.g. multiple cargo pants pockets?)
+            # Or usually we want one mask. 
+            # Let's take the union of all masks.
+            if masks.shape[0] > 0:
+                final_mask = torch.any(masks, dim=0).squeeze().cpu().numpy().astype(np.uint8) * 255
+                
+                # Resize only for saving if needed? No, save original resolution mask.
+            else:
+                continue
 
-            mask = (masks[0] * 255).astype(np.uint8)
-            cv2.imwrite(out_path, mask)
+            cv2.imwrite(out_path, final_mask)
 
             stats.processed += 1
 
