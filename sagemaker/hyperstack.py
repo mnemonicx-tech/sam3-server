@@ -107,6 +107,9 @@ def get_boxes_from_text(model, image, caption, box_threshold, text_threshold, de
     boxes_filt = boxes[filt_mask]
     
     return boxes_filt
+
+
+def load_prompts(prompts_path: str) -> dict:
     if not os.path.exists(prompts_path):
         raise FileNotFoundError(f"❌ prompts.json not found: {prompts_path}")
     with open(prompts_path, "r", encoding="utf-8") as f:
