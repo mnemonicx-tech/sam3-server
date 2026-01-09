@@ -10,7 +10,7 @@ from segment_anything import sam_model_registry, SamPredictor
 
 # ------------- Defaults -------------
 DEFAULT_MODEL_PATH = "./models/sam3.pt"
-DEFAULT_PROMPTS_PATH = "./prompts.json"
+DEFAULT_PROMPTS_PATH = os.path.join(os.path.dirname(__file__), "prompts.json")
 DEFAULT_MAX_RES = 1024
 DEFAULT_LOG_EVERY = 500
 DEFAULT_INPUT_ROOT = "./input"
