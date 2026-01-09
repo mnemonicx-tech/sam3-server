@@ -114,38 +114,27 @@ def main():
     sam.eval()
     predictor = SamPredictor(sam)
 
-    total = processed = skipped = 0
+    # Stats tracker
+    class Stats:
+        def __init__(self):
+            self.total = 0
+            self.processed = 0
+            self.skipped = 0
 
-    # ---------------- Main loop ----------------
-    for category in sorted(os.listdir(args.input)):
-        cat_input = os.path.join(args.input, category)
-        cat_output = os.path.join(args.output, category)
+    stats = Stats()
 
-        if not os.path.isdir(cat_input):
-            continue
-
-        prompt = prompts.get(category)
-        if not prompt:
-            print(f"⚠️ No prompt found in prompts.json for: {category} → skipping")
-            continue
-
-        ensure_dir(cat_output)
-
-        img_list = list(sorted(list_images(cat_input)))
-        if not img_list:
-            continue
-
-        print(f"\n📂 Category: {category} | Images: {len(img_list)}")
-
+    def process_batch(img_list, current_input_dir, current_output_dir, prompt):
+        print(f"\n📂 Category: {os.path.basename(current_output_dir)} | Images: {len(img_list)}")
+        
         for img_name in img_list:
-            total += 1
-            img_path = os.path.join(cat_input, img_name)
+            stats.total += 1
+            img_path = os.path.join(current_input_dir, img_name)
 
             base = os.path.splitext(img_name)[0]
-            out_path = os.path.join(cat_output, f"{base}_mask.png")
+            out_path = os.path.join(current_output_dir, f"{base}_mask.png")
 
             if os.path.exists(out_path):
-                skipped += 1
+                stats.skipped += 1
                 continue
 
             image = cv2.imread(img_path)
@@ -169,16 +158,69 @@ def main():
             mask = (masks[0] * 255).astype(np.uint8)
             cv2.imwrite(out_path, mask)
 
-            processed += 1
+            stats.processed += 1
 
-            if processed % args.log_every == 0:
-                print(f"✅ Processed={processed} | Skipped={skipped} | Total={total}")
+            if stats.processed % args.log_every == 0:
+                print(f"✅ Processed={stats.processed} | Skipped={stats.skipped} | Total={stats.total}")
                 torch.cuda.empty_cache()
 
+    # ---------------- Main loop ----------------
+    # 1. Identify all files in input root and group them if they match known prompts
+    flat_images = {}
+    input_items = sorted(os.listdir(args.input))
+    prompt_keys = sorted(prompts.keys(), key=len, reverse=True)
+
+    for item in input_items:
+        item_path = os.path.join(args.input, item)
+        
+        # If directory -> Use existing logic
+        if os.path.isdir(item_path):
+            category = item
+            prompt = prompts.get(category)
+            if not prompt:
+                print(f"⚠️ No prompt for directory='{category}' -> skipping")
+                continue
+
+            cat_output = os.path.join(args.output, category)
+            ensure_dir(cat_output)
+
+            img_list = list(sorted(list_images(item_path)))
+            if img_list:
+                process_batch(img_list, item_path, cat_output, prompt)
+           
+        # If file -> Try to infer category
+        elif os.path.isfile(item_path):
+            if not any(item.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                continue
+
+            # Find matching category
+            matched_cat = None
+            for key in prompt_keys:
+                if item.startswith(key):
+                    matched_cat = key
+                    break
+            
+            if matched_cat:
+                if matched_cat not in flat_images:
+                    flat_images[matched_cat] = []
+                flat_images[matched_cat].append(item)
+
+    # 2. Process gathered flat images
+    for category, img_list in flat_images.items():
+        prompt = prompts.get(category)
+        if not prompt:
+            continue
+            
+        cat_output = os.path.join(args.output, category)
+        ensure_dir(cat_output)
+        
+        # For flat files, input dir is just args.input
+        process_batch(img_list, args.input, cat_output, prompt)
+
     print("\n✅ SAM batch segmentation completed")
-    print(f"Total seen: {total}")
-    print(f"Processed: {processed}")
-    print(f"Skipped: {skipped}")
+    print(f"Total seen: {stats.total}")
+    print(f"Processed: {stats.processed}")
+    print(f"Skipped: {stats.skipped}")
 
     # ---------------- Upload output ----------------
     if args.upload_output:
