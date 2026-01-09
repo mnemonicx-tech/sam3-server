@@ -17,7 +17,7 @@ OUTPUT_S3_DATA = "s3://kishankumarhs/sam3_output/"
 MODEL_S3_URI = "s3://kishankumarhs/sam3-models/sam3.pt"
 
 # Compute Config
-INSTANCE_TYPE = "ml.g5.4xlarge"
+INSTANCE_TYPE = "ml.g4dn.xlarge"
 INSTANCE_COUNT = 1
 JOB_NAME_PREFIX = "sam3-batch-process"
 
