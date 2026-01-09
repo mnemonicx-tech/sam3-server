@@ -109,6 +109,32 @@ def get_boxes_from_text(model, image, caption, box_threshold, text_threshold, de
     return boxes_filt
 
 
+def mask_to_yolo_polygon(mask, width, height):
+    """
+    Convert binary mask to YOLO polygon format:
+    <class_id> <x1> <y1> <x2> <y2> ...
+    Normalized coordinates.
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polygons = []
+    
+    for contour in contours:
+        if cv2.contourArea(contour) < 200: # Filter small noise
+            continue
+            
+        contour = contour.flatten().astype(float)
+        
+        # Normalize
+        contour[0::2] /= width
+        contour[1::2] /= height
+        
+        # Limit precision
+        contour = np.round(contour, 4)
+        polygons.append(contour.tolist())
+        
+    return polygons
+
+
 def load_prompts(prompts_path: str) -> dict:
     if not os.path.exists(prompts_path):
         raise FileNotFoundError(f"❌ prompts.json not found: {prompts_path}")
@@ -135,6 +161,9 @@ def main():
     parser.add_argument("--s3-input-uri", default=DEFAULT_S3_INPUT_URI)
     parser.add_argument("--s3-sample-uri", default=DEFAULT_S3_SAMPLE_URI)
     parser.add_argument("--s3-output-uri", default=DEFAULT_S3_OUTPUT_URI)
+
+    parser.add_argument("--box-threshold", type=float, default=0.35, help="GroundingDINO box threshold")
+    parser.add_argument("--text-threshold", type=float, default=0.25, help="GroundingDINO text threshold")
 
     args = parser.parse_args()
 
@@ -211,7 +240,7 @@ def main():
             image_gd_tensor = transform_image_for_gd(image_pil)
             
             # 1. GroundingDINO: Text -> Boxes
-            boxes_filt = get_boxes_from_text(gd_model, image_gd_tensor, prompt, BOX_THRESHOLD, TEXT_THRESHOLD, device)
+            boxes_filt = get_boxes_from_text(gd_model, image_gd_tensor, prompt, args.box_threshold, args.text_threshold, device)
             
             if len(boxes_filt) == 0:
                 # No object found matching prompt
@@ -248,14 +277,49 @@ def main():
             # Combine masks if multiple boxes found (e.g. multiple cargo pants pockets?)
             # Or usually we want one mask. 
             # Let's take the union of all masks.
+            # Combine masks if multiple boxes found
             if masks.shape[0] > 0:
                 final_mask = torch.any(masks, dim=0).squeeze().cpu().numpy().astype(np.uint8) * 255
-                
-                # Resize only for saving if needed? No, save original resolution mask.
             else:
                 continue
 
+            # Save Mask
             cv2.imwrite(out_path, final_mask)
+            
+            # --- YOLO Label & Visualization ---
+            H, W = final_mask.shape[:2]
+            polygons = mask_to_yolo_polygon(final_mask, W, H)
+            
+            if polygons:
+                # 1. Save YOLO .txt
+                txt_path = os.path.join(current_output_dir, f"{base}.txt")
+                with open(txt_path, 'w') as f:
+                    for poly in polygons:
+                        # Class ID 0 by default
+                        line = "0 " + " ".join(map(str, poly))
+                        f.write(line + "\n")
+                
+                # 2. Save Visualization Overlay
+                overlay_path = os.path.join(current_output_dir, f"{base}_overlay.jpg")
+                
+                # Draw on original image (opencv uses BGR)
+                vis_img = image_cv.copy() 
+                
+                # Convert normalized polys back to pixel coords for drawing
+                for poly in polygons:
+                    # poly is [x1, y1, x2, y2, ...] normalized
+                    pts = np.array(poly).reshape(-1, 2)
+                    pts[:, 0] *= W
+                    pts[:, 1] *= H
+                    pts = pts.astype(np.int32)
+                    
+                    # Draw polygon line (Green, thickness 2)
+                    cv2.polylines(vis_img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+                    
+                    # Optional: Fill semi-transparent??
+                    # For now just line as per user request "polygon info"
+                
+                cv2.imwrite(overlay_path, vis_img)
 
             stats.processed += 1
 
