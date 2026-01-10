@@ -165,7 +165,7 @@ def process_batch(args, predictor, prompts_dict, device):
             
             # 2. Predict with text
             print(f"DEBUG: Using prompt='{prompt_text}' for {filename}")
-            results = predictor(text=[prompt_text])
+            results = predictor(text=[prompt_text], conf=args.box_threshold)
             
             # results is a list of Results objects (one per prompt text? or one per image?)
             # Since we set_image once and passed 1 text prompt, we likely get 1 result object or list of objects found for that prompt.
@@ -292,7 +292,7 @@ if __name__ == "__main__":
     parser.add_argument("--s3-output-uri", default=DEFAULT_S3_OUTPUT_URI)
     
     # SAM 3 Configs
-    parser.add_argument("--box-threshold", type=float, default=0.4, help="Confidence threshold (maps to conf in SAM3)")
+    parser.add_argument("--box-threshold", type=float, default=0.25, help="Confidence threshold (maps to conf in SAM3)")
 
     args = parser.parse_args()
 
