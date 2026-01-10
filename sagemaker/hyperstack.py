@@ -305,177 +305,52 @@ if __name__ == "__main__":
 
     # 2. Download Input (Placeholder S3 logic - user should handle via s3 sync or similar for now if strictly local, 
     # but keeping original flow if they use the flags)
+    # 2. Download Input (Placeholder S3 logic - user should handle via s3 sync or similar for now if strictly local, 
+    # but keeping original flow if they use the flags)
     if args.download_input:
-            out_path = os.path.join(current_output_dir, f"{base}_mask.png")
+        if args.mode == "sample":
+            print(f"Downloading samples from {args.s3_sample_uri}...")
+            subprocess.call(["aws", "s3", "sync", args.s3_sample_uri, args.input, "--quiet"])
+        else:
+            print(f"Downloading inputs from {args.s3_input_uri}...")
+            subprocess.call(["aws", "s3", "sync", args.s3_input_uri, args.input, "--quiet"])
+    
+    # 3. Load Prompts
+    prompts = load_prompts(args.prompts)
+    print(f"Loaded {len(prompts)} category prompts.")
 
-            if os.path.exists(out_path):
-                stats.skipped += 1
-                continue
+    # 4. Initialize SAM 3 Predictor
+    print(f"Initializing SAM 3 Predictor with model={args.model}...")
+    overrides = dict(
+        conf=args.box_threshold, # Mapping box_threshold to conf for consistency with old args
+        task="segment",
+        mode="predict",
+        model=args.model,
+        # half=True, # Optional: Float16
+        save=False,  # We handle saving manually
+    )
+    
+    # Check device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    try:
+        predictor = SAM3SemanticPredictor(overrides=overrides)
+    except Exception as e:
+        print(f"Failed to initialize predictor: {e}")
+        exit(1)
 
-            # Load image
-            image_cv = cv2.imread(img_path)
-            if image_cv is None:
-                continue
-            
-            # Prepare image for SAM (RGB)
-            image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-            
-            # Prepare image for GroundingDINO (PIL -> Tensor)
-            image_pil = Image.fromarray(image_rgb)
-            image_gd_tensor = transform_image_for_gd(image_pil)
-            
-            # 1. GroundingDINO: Text -> Boxes
-            boxes_filt = get_boxes_from_text(gd_model, image_gd_tensor, prompt, args.box_threshold, args.text_threshold, device)
-            
-            if len(boxes_filt) == 0:
-                # No object found matching prompt
-                continue
-
-            # Convert boxes (cx, cy, w, h) norm -> (x1, y1, x2, y2) pixel
-            H, W = image_rgb.shape[:2]
-            boxes_xyxy = boxes_filt * torch.Tensor([W, H, W, H])
-            boxes_xyxy[:, :2] -= boxes_xyxy[:, 2:] / 2
-            boxes_xyxy[:, 2:] += boxes_xyxy[:, :2]
-
-            # 2. SAM: Image + Boxes -> Mask
-            # We resize for SAM after getting boxes? 
-            # Actually efficient way: Resize first? 
-            # Note: The original script resized first. But DINO needs original quality usually.
-            # Let's keep original resolution for DINO detection, then pass to SAM.
-            # SAM handles resizing internally usually via predictor.set_image.
-            # If we want to use the resized logic from before, we need to resize boxes too.
-            # For simplicity and accuracy, let's use original resolution (SAM is heavy but fits on A4000).
-            # If OOM, we can resize. A4000 has 16GB. 1024x1024 is fine.
-            
-            predictor.set_image(image_rgb)
-            
-            transformed_boxes = predictor.transform.apply_boxes_torch(boxes_xyxy.to(device), image_rgb.shape[:2])
-
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                masks, _, _ = predictor.predict_torch(
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=transformed_boxes, # Use all boxes
-                    multimask_output=False,
-                )
-            
-            # Combine masks if multiple boxes found (e.g. multiple cargo pants pockets?)
-            # Or usually we want one mask. 
-            # Let's take the union of all masks.
-            # Combine masks if multiple boxes found
-            if masks.shape[0] > 0:
-                final_mask = torch.any(masks, dim=0).squeeze().cpu().numpy().astype(np.uint8) * 255
-            else:
-                continue
-
-            # Save Mask
-            cv2.imwrite(out_path, final_mask)
-            
-            # --- YOLO Label & Visualization ---
-            H, W = final_mask.shape[:2]
-            polygons = mask_to_yolo_polygon(final_mask, W, H)
-            
-            if polygons:
-                # 1. Save YOLO .txt
-                txt_path = os.path.join(current_output_dir, f"{base}.txt")
-                with open(txt_path, 'w') as f:
-                    for poly in polygons:
-                        # Class ID 0 by default
-                        line = "0 " + " ".join(map(str, poly))
-                        f.write(line + "\n")
-                
-                # 2. Save Visualization Overlay
-                overlay_path = os.path.join(current_output_dir, f"{base}_overlay.jpg")
-                
-                # Draw on original image (opencv uses BGR)
-                vis_img = image_cv.copy() 
-                
-                # Convert normalized polys back to pixel coords for drawing
-                for poly in polygons:
-                    # poly is [x1, y1, x2, y2, ...] normalized
-                    pts = np.array(poly).reshape(-1, 2)
-                    pts[:, 0] *= W
-                    pts[:, 1] *= H
-                    pts = pts.astype(np.int32)
-                    
-                    # Draw polygon line (Green, thickness 2)
-                    cv2.polylines(vis_img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-                    
-                    # Optional: Fill semi-transparent??
-                    # For now just line as per user request "polygon info"
-                
-                cv2.imwrite(overlay_path, vis_img)
-
-            stats.processed += 1
-
-            if stats.processed % args.log_every == 0:
-                print(f"✅ Processed={stats.processed} | Skipped={stats.skipped} | Total={stats.total}")
-                torch.cuda.empty_cache()
-
-    # ---------------- Main loop ----------------
-    # 1. Identify all files in input root and group them if they match known prompts
-    flat_images = {}
-    input_items = sorted(os.listdir(args.input))
-    prompt_keys = sorted(prompts.keys(), key=len, reverse=True)
-
-    for item in input_items:
-        item_path = os.path.join(args.input, item)
-        
-        # If directory -> Use existing logic
-        if os.path.isdir(item_path):
-            category = item
-            prompt = prompts.get(category)
-            if not prompt:
-                print(f"⚠️ No prompt for directory='{category}' -> skipping")
-                continue
-
-            cat_output = os.path.join(args.output, category)
-            ensure_dir(cat_output)
-
-            img_list = list(sorted(list_images(item_path)))
-            if img_list:
-                process_batch(img_list, item_path, cat_output, prompt)
-           
-        # If file -> Try to infer category
-        elif os.path.isfile(item_path):
-            if not any(item.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-                continue
-
-            # Find matching category
-            matched_cat = None
-            for key in prompt_keys:
-                if item.startswith(key):
-                    matched_cat = key
-                    break
-            
-            if matched_cat:
-                if matched_cat not in flat_images:
-                    flat_images[matched_cat] = []
-                flat_images[matched_cat].append(item)
-
-    # 2. Process gathered flat images
-    for category, img_list in flat_images.items():
-        prompt = prompts.get(category)
-        if not prompt:
-            continue
-            
-        cat_output = os.path.join(args.output, category)
-        ensure_dir(cat_output)
-        
-        # For flat files, input dir is just args.input
-        process_batch(img_list, args.input, cat_output, prompt)
-
-    print("\n✅ SAM batch segmentation completed")
-    print(f"Total seen: {stats.total}")
+    # 5. Process
+    stats = process_batch(args, predictor, prompts, device)
+    
+    print(f"\n--- Batch Complete ---")
+    print(f"Total: {stats.total}")
     print(f"Processed: {stats.processed}")
-    print(f"Skipped: {stats.skipped}")
+    print(f"Skipped/Failed: {stats.skipped}")
 
-    # ---------------- Upload output ----------------
-    if args.upload_output:
-        print(f"⬆️ Uploading masks to S3: {args.s3_output_uri}")
-        run(f"aws s3 sync {args.output} {args.s3_output_uri} --no-progress")
-        print("✅ Upload complete")
-
-
-if __name__ == "__main__":
-    main()
+    # 6. Upload Output
+    if args.upload_output and args.s3_output_uri != DEFAULT_S3_OUTPUT_URI:
+        print(f"Uploading output to {args.s3_output_uri}...")
+        subprocess.call(["aws", "s3", "sync", args.output, args.s3_output_uri, "--quiet"])
+    
+    print("Done!")
