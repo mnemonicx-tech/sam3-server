@@ -299,7 +299,7 @@ if __name__ == "__main__":
             subprocess.call(["aws", "s3", "sync", args.s3_sample_uri, args.input, "--quiet"])
         else:
             print(f"Downloading inputs from {args.s3_input_uri}...")
-            subprocess.call(["aws", "s3", "sync", args.s3_input_uri, args.input, "--quiet"])
+            subprocess.call(["aws", "s3", "sync", args.s3_input_uri, args.input])
     
     # 3. Load Prompts
     prompts = load_prompts(args.prompts)
