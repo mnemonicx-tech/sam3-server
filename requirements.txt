@@ -13,3 +13,4 @@ torch
 sagemaker
 wget
 ultralytics>=8.3.237
+huggingface_hub
