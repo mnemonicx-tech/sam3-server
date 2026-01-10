@@ -12,5 +12,4 @@ pytest-asyncio
 torch
 sagemaker
 wget
-wget
-git+https://github.com/facebookresearch/sam3.git
+ultralytics>=8.3.237

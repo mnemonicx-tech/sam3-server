@@ -1,45 +1,32 @@
 import sys
 import inspect
 
-print("🔍 Inspecting installed SAM 3 headers...")
+print("🔍 Inspecting Ultralytics for SAM 3 support...")
 
 try:
-    import sam3
-    print("✅ Successfully imported 'sam3'")
-    print(f"📁 Package location: {sam3.__file__}")
-    print(f"📜 Top-level contents: {dir(sam3)}")
-
-    # Check for build functions
-    if hasattr(sam3, "build_sam3"):
-        print("✅ Found 'build_sam3'")
+    import ultralytics
+    print(f"✅ Successfully imported 'ultralytics': {ultralytics.__version__}")
     
-    # Check for predictor
-    if hasattr(sam3, "Sam3Predictor") or hasattr(sam3, "SAM3Predictor"):
-        print("✅ Found Predictor class")
+    from ultralytics import SAM
+    print("✅ Found 'SAM' class in ultralytics")
     
-    # Prrint recursive search for "predict" methods
-    print("\n🔍 Searching for 'predict' method signature...")
-    
-    def find_predict(module, path="sam3"):
-        for name, obj in inspect.getmembers(module):
-            if inspect.isclass(obj):
-                if name.startswith("Sam") or name.startswith("SAM"):
-                    # Check methods
-                    for m_name, m_obj in inspect.getmembers(obj):
-                        if m_name == "predict":
-                             print(f"  ➡️ Found {path}.{name}.predict signature: {inspect.signature(m_obj)}")
-            elif inspect.ismodule(obj) and name.startswith("sam3"):
-                 # Recurse (limit depth ideally, but basic is fine)
-                 pass
+    # Check if we can find SAM3 references
+    import ultralytics.models.sam
+    print(f"📜 ultralytics.models.sam contents: {dir(ultralytics.models.sam)}")
 
-    find_predict(sam3)
-
-except ImportError:
-    print("❌ Could not import 'sam3'. Trying 'segment_anything_3'...")
+    # Try to find specific predictor classes
     try:
-        import segment_anything_3
-        print("✅ Successfully imported 'segment_anything_3'")
-        print(f"📜 Contents: {dir(segment_anything_3)}")
+        from ultralytics.models.sam import SAM3SemanticPredictor
+        print("✅ Found 'SAM3SemanticPredictor'")
     except ImportError:
-        print("❌ Could not import 'sam3' or 'segment_anything_3'. Check installation.")
+        print("❌ Could not import 'SAM3SemanticPredictor' directly")
+
+    # Inspect the SAM object to see if it handles 'sam3' weights
+    print("\nℹ️  To verify SAM 3 support, we usually just load the model:")
+    print("   model = SAM('sam3_large.pt')")
+    print("   results = model(source='image.jpg', bboxes=[...], labels=[...])")
+
+except ImportError as e:
+    print(f"❌ Error: {e}")
+    print("Make sure you have installed: pip install ultralytics>=8.3.237")
 
