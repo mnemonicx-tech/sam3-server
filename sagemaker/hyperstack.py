@@ -321,13 +321,14 @@ if __name__ == "__main__":
 
     # 4. Initialize SAM 3 Predictor
     print(f"Initializing SAM 3 Predictor with model={args.model}...")
+    # Matches user's working Colab snippet
     overrides = dict(
-        conf=args.box_threshold, # Mapping box_threshold to conf for consistency with old args
+        conf=args.box_threshold, 
         task="segment",
         mode="predict",
         model=args.model,
-        # half=True, # Optional: Float16
-        save=False,  # We handle saving manually
+        half=True,  # FP16
+        save=True,  # Ultralytics quirk? Maybe needed for internal pipeline
     )
     
     # Check device
