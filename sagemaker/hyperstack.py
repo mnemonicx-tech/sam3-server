@@ -136,16 +136,15 @@ def process_batch(args, predictor, prompts_dict, device):
         if not prompt_text:
             print(f"Skipping {filename}: No prompt found for category '{category}'")
             stats.skipped += 1
+            # Copy to failed
+            failed_path = os.path.join(args.output, "_failed", category, filename)
+            ensure_dir(os.path.dirname(failed_path))
+            shutil.copy2(img_path, failed_path)
             continue
 
         base_name = os.path.splitext(filename)[0]
         
-        # Output structure: preserve subdirectory structure relative to input? 
-        # Or simple flat output as per original script logic which seemed to use output root directly or subdirs.
-        # Let's mirror the input folder structure if it was inside a category folder, 
-        # otherwise put it in category folder in output.
-        
-        # Simplified: Output to args.output/<category>/
+        # ... (rest of path setup) ...
         cat_out_dir = os.path.join(args.output, category)
         ensure_dir(cat_out_dir)
         
@@ -153,42 +152,33 @@ def process_batch(args, predictor, prompts_dict, device):
         out_label_path = os.path.join(cat_out_dir, f"{base_name}.txt")
         out_overlay_path = os.path.join(cat_out_dir, f"{base_name}_overlay.jpg")
         
-        if os.path.exists(out_mask_path) and not args.upload_output: # upload-output flag reused as "force overwrite" maybe?
-             # For now, just continue if exists unless forced? Script doesn't say. Let's process.
+        if os.path.exists(out_mask_path) and not args.upload_output: 
              pass
 
         try:
             # --- SAM 3 Prediction ---
-            # 1. Set Image
-            # SAM3SemanticPredictor handles loading.
             predictor.set_image(img_path)
             
-            # 2. Predict with text
             print(f"DEBUG: Using prompt='{prompt_text}' for {filename}")
-            results = predictor(text=[prompt_text], conf=args.box_threshold)
-            
-            # results is a list of Results objects (one per prompt text? or one per image?)
-            # Since we set_image once and passed 1 text prompt, we likely get 1 result object or list of objects found for that prompt.
-            # Ultralytics results: result[0].masks.data is torch tensor
+            results = predictor(text=[prompt_text])
             
             final_mask = None
-            
             if results and results[0].masks is not None:
-                # Combine all found instances for this prompt into one binary mask
-                # masks.data is (N, H, W) where N is number of objects found
-                masks_tensor = results[0].masks.data # GPU tensor usually
-                
+                masks_tensor = results[0].masks.data
                 if masks_tensor.numel() > 0:
-                    # Union of all masks
                     files_mask = torch.any(masks_tensor, dim=0).squeeze().cpu().numpy().astype(np.uint8) * 255
                     final_mask = files_mask
             
             if final_mask is None:
                # No detection
                stats.skipped += 1
+               # Copy to failed
+               failed_path = os.path.join(args.output, "_failed", category, filename)
+               ensure_dir(os.path.dirname(failed_path))
+               shutil.copy2(img_path, failed_path)
                continue
 
-            # --- Save Outputs ---
+            # ... (Save Outputs) ...
             
             # 1. Mask
             cv2.imwrite(out_mask_path, final_mask)
@@ -199,16 +189,12 @@ def process_batch(args, predictor, prompts_dict, device):
             # 2. YOLO Label
             poly_str = mask_to_yolo_polygon(final_mask, W, H)
             if poly_str:
-                # Class ID 0 for all? Or specific id? 
-                # Originally we didn't have class mapping. Let's assume 0.
                 with open(out_label_path, "w") as f:
                     f.write(f"0 {poly_str}\n")
             
             # 3. Visualization
-            # Draw polygon on original image
             if poly_str:
                 coords = [float(x) for x in poly_str.split()]
-                # Rescale to pixels
                 pts = []
                 for j in range(0, len(coords), 2):
                     px = int(coords[j] * W)
@@ -220,24 +206,21 @@ def process_batch(args, predictor, prompts_dict, device):
                 cv2.polylines(original_img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
                 cv2.imwrite(out_overlay_path, original_img)
 
-            # 4. Copy Original Image (Ensure YOLO dataset completeness)
+            # 4. Copy Original Image
             out_image_path = os.path.join(cat_out_dir, f"{base_name}{os.path.splitext(filename)[1]}")
             if not os.path.exists(out_image_path):
                 shutil.copy2(img_path, out_image_path)
 
             # 5. Metadata Collection
-            # Extract confidence (max of detected objects)
             conf_score = 0.0
             try:
                 if results[0].boxes is not None and results[0].boxes.conf is not None:
                     if results[0].boxes.conf.numel() > 0:
                         conf_score = float(results[0].boxes.conf.max().item())
             except Exception:
-                pass # Default to 0.0 if extraction fails
+                pass 
 
-            # Rule: < 0.60 -> human review
             human_review = conf_score < 0.60
-            
             category_metadata[category].append({
                 "image": filename,
                 "confidence": round(conf_score, 4),
@@ -249,6 +232,10 @@ def process_batch(args, predictor, prompts_dict, device):
         except Exception as e:
             print(f"Error processing {filename}: {e}")
             stats.skipped += 1
+            # Copy to failed
+            failed_path = os.path.join(args.output, "_failed", category, filename)
+            ensure_dir(os.path.dirname(failed_path))
+            shutil.copy2(img_path, failed_path)
             continue
 
     # --- Write Metadata JSONs ---
