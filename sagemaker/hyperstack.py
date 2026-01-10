@@ -164,8 +164,7 @@ def process_batch(args, predictor, prompts_dict, device):
             predictor.set_image(img_path)
             
             # 2. Predict with text
-            # The user snippet passes list: text=['blazer']
-            # We can pass multiple if we wanted, but here we have 1 category prompt.
+            print(f"DEBUG: Using prompt='{prompt_text}' for {filename}")
             results = predictor(text=[prompt_text])
             
             # results is a list of Results objects (one per prompt text? or one per image?)
