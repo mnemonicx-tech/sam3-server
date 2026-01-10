@@ -3,6 +3,7 @@ import os
 import json
 import argparse
 import subprocess
+import shutil
 import cv2
 import torch
 import numpy as np
@@ -85,6 +86,8 @@ def download_sam3_model(model_path):
 
 # ------------- Main Processor -------------
 
+from collections import defaultdict
+
 class Stats:
     def __init__(self):
         self.total = 0
@@ -93,6 +96,7 @@ class Stats:
 
 def process_batch(args, predictor, prompts_dict, device):
     stats = Stats()
+    category_metadata = defaultdict(list)
     
     # Gather all images
     # We support flat directory or category-subdirectories. 
@@ -217,13 +221,52 @@ def process_batch(args, predictor, prompts_dict, device):
                 cv2.polylines(original_img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
                 cv2.imwrite(out_overlay_path, original_img)
 
+            # 4. Copy Original Image (Ensure YOLO dataset completeness)
+            out_image_path = os.path.join(cat_out_dir, f"{base_name}{os.path.splitext(filename)[1]}")
+            if not os.path.exists(out_image_path):
+                shutil.copy2(img_path, out_image_path)
+
+            # 5. Metadata Collection
+            # Extract confidence (max of detected objects)
+            conf_score = 0.0
+            try:
+                if results[0].boxes is not None and results[0].boxes.conf is not None:
+                    if results[0].boxes.conf.numel() > 0:
+                        conf_score = float(results[0].boxes.conf.max().item())
+            except Exception:
+                pass # Default to 0.0 if extraction fails
+
+            # Rule: < 0.60 -> human review
+            human_review = conf_score < 0.60
+            
+            category_metadata[category].append({
+                "image": filename,
+                "confidence": round(conf_score, 4),
+                "human_review_needed": human_review
+            })
+
             stats.processed += 1
             
         except Exception as e:
             print(f"Error processing {filename}: {e}")
             stats.skipped += 1
             continue
-            
+
+    # --- Write Metadata JSONs ---
+    for cat, meta_list in category_metadata.items():
+        if not meta_list:
+            continue
+        
+        meta_path = os.path.join(args.output, cat, "metadata.json")
+        try:
+            # If exists, maybe load and append? For now, we overwrite or it's a batch job.
+            # Let's assume batch job per run.
+            with open(meta_path, "w") as f:
+                json.dump(meta_list, f, indent=2)
+            print(f"Saved metadata to {meta_path}")
+        except Exception as e:
+            print(f"Failed to save metadata for {cat}: {e}")
+
     return stats
 
 
