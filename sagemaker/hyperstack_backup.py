@@ -24,50 +24,6 @@ DEFAULT_S3_INPUT_URI = "s3://my-bucket/input/"
 DEFAULT_S3_SAMPLE_URI = "s3://my-bucket/sample_data/"
 DEFAULT_S3_OUTPUT_URI = "s3://my-bucket/output/"
 
-# ---------------- FALLBACK PROMPTS ----------------
-FALLBACK_PROMPTS = {
-    "ethnic_wear_women_sharara": [
-        "wide leg pants worn by a woman",
-        "long kurta worn by a woman",
-        "dupatta worn by a woman",
-    ],
-    "ethnic_wear_women_lehenga_choli": [
-        "long skirt worn by a woman",
-        "blouse worn by a woman",
-        "dupatta worn by a woman",
-    ],
-    "ethnic_wear_women_palazzo_set": [
-        "palazzo pants worn by a woman",
-        "kurta worn by a woman",
-    ],
-    "fusion_wear_women_indo-western_dress": [
-        "long dress worn by a woman",
-        "kurta worn by a woman",
-    ],
-    "fusion_wear_women_kaftan": [
-        "loose dress worn by a woman",
-        "long tunic worn by a woman",
-    ],
-    "sleepwear_men_pyjama_set": [
-        "pajama pants worn by a person",
-        "t-shirt worn by a person",
-    ],
-    "general_unisex_tracksuit": [
-        "track pants worn by a person",
-        "jacket worn by a person",
-    ],
-}
-
-def union_masks(results):
-    final_mask = None
-    for r in results:
-        if r.masks is not None:
-            # Check if masks.data is not empty
-            if r.masks.data.numel() > 0:
-                m = r.masks.data.any(dim=0).cpu().numpy().astype(np.uint8) * 255
-                final_mask = m if final_mask is None else np.maximum(final_mask, m)
-    return final_mask
-
 def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
@@ -200,34 +156,18 @@ def process_batch(args, predictor, prompts_dict, device):
              pass
 
         try:
-            # --- SAM 3 Prediction (Multi-Pass Fallback) ---
+            # --- SAM 3 Prediction ---
             predictor.set_image(img_path)
             
-            final_mask = None
+            print(f"DEBUG: Using prompt='{prompt_text}' for {filename}")
+            results = predictor(text=[prompt_text])
             
-            # -------- PASS 1: Base Prompt --------
-            # Try specific prompt like "a person wearing {prompt}"
-            print(f"DEBUG: Pass 1 - Using prompt='a person wearing {prompt_text}' for {filename}")
-            results = predictor(text=[f"a person wearing {prompt_text}"])
-            final_mask = union_masks(results)
-
-            # -------- PASS 2: Fallback Prompts --------
-            if final_mask is None and category in FALLBACK_PROMPTS:
-                print(f"DEBUG: Pass 2 - Using fallback prompts for {category}")
-                results = predictor(text=FALLBACK_PROMPTS[category])
-                final_mask = union_masks(results)
-
-            # -------- PASS 3: Generic Prompt --------
-            if final_mask is None:
-                print(f"DEBUG: Pass 3 - Using generic prompt 'a person wearing clothing'")
-                results = predictor(text=["a person wearing clothing"])
-                final_mask = union_masks(results)
-
-            if final_mask is not None:
-                # Morphology fill (from hyperstack2.py)
-                kernel = np.ones((25, 25), np.uint8)
-                final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
-
+            final_mask = None
+            if results and results[0].masks is not None:
+                masks_tensor = results[0].masks.data
+                if masks_tensor.numel() > 0:
+                    files_mask = torch.any(masks_tensor, dim=0).squeeze().cpu().numpy().astype(np.uint8) * 255
+                    final_mask = files_mask
             
             if final_mask is None:
                # No detection
