@@ -150,6 +150,7 @@ def process_batch(args, predictor, prompts_dict, device):
     # (path, filename, category)
     
     for root, dirs, files in os.walk(args.input):
+        files.sort()
         for file in files:
             if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
                 full_path = os.path.join(root, file)
@@ -376,7 +377,7 @@ if __name__ == "__main__":
         model=args.model,
         imgsz=1024,
         half=True,  # FP16
-        save=True,  # Ultralytics quirk? Maybe needed for internal pipeline
+        save=False,  # Ultralytics quirk? Maybe needed for internal pipeline
     )
     
     # Check device
