@@ -196,8 +196,9 @@ def process_batch(args, predictor, prompts_dict, device):
         out_label_path = os.path.join(cat_out_dir, f"{base_name}.txt")
         out_overlay_path = os.path.join(cat_out_dir, f"{base_name}_overlay.jpg")
         
-        if os.path.exists(out_mask_path) and not args.upload_output: 
-             pass
+        if os.path.exists(out_mask_path):
+            stats.processed += 1
+            continue
 
         try:
             # --- SAM 3 Prediction (Multi-Pass Fallback) ---
@@ -373,6 +374,7 @@ if __name__ == "__main__":
         task="segment",
         mode="predict",
         model=args.model,
+        imgsz=1024,
         half=True,  # FP16
         save=True,  # Ultralytics quirk? Maybe needed for internal pipeline
     )
