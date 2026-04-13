@@ -40,7 +40,7 @@ FALLBACK_PROMPTS = {
         "palazzo pants worn by a woman",
         "kurta worn by a woman",
     ],
-    "fusion_wear_women_indo-western_dress": [
+    "fusion_wear_women_indo_western_dress": [
         "long dress worn by a woman",
         "kurta worn by a woman",
     ],
@@ -148,7 +148,13 @@ def process_batch(args, predictor, prompts_dict, device):
     
     image_files = []
     # (path, filename, category)
-    
+
+    # Filter to specific categories if --categories was provided
+    allowed_categories = None
+    if hasattr(args, 'categories') and args.categories:
+        allowed_categories = set(c.strip() for c in args.categories.split(','))
+        print(f"Filtering to {len(allowed_categories)} categories: {', '.join(sorted(allowed_categories))}")
+
     for root, dirs, files in os.walk(args.input):
         files.sort()
         for file in files:
@@ -168,7 +174,8 @@ def process_batch(args, predictor, prompts_dict, device):
                             break
                 
                 if category:
-                    image_files.append((full_path, file, category))
+                    if allowed_categories is None or category in allowed_categories:
+                        image_files.append((full_path, file, category))
     
     stats.total = len(image_files)
     print(f"Found {stats.total} images to process.")
@@ -342,6 +349,7 @@ if __name__ == "__main__":
     
     # SAM 3 Configs
     parser.add_argument("--box-threshold", type=float, default=0.25, help="Confidence threshold (maps to conf in SAM3)")
+    parser.add_argument("--categories", type=str, default="", help="Comma-separated list of category names to process (leave empty to process all)")
 
     args = parser.parse_args()
 
