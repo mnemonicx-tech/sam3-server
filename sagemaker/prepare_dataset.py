@@ -174,12 +174,78 @@ def setup_logging(output_dir: str) -> logging.Logger:
     return logger
 
 
+def _save_valid_samples_cache(samples: List[Sample], cache_path: str, report: PipelineReport, logger: logging.Logger):
+    """Persist validated samples + report counters so resume can skip discovery+validation."""
+    with open(cache_path, "w") as f:
+        # First line: report counters
+        header = {
+            "_type": "report",
+            "total_found": report.total_found,
+            "valid": report.valid,
+            "removed_missing": report.removed_missing,
+            "removed_corrupted": report.removed_corrupted,
+            "removed_small_mask": report.removed_small_mask,
+            "removed_invalid_label": report.removed_invalid_label,
+        }
+        f.write(json.dumps(header, separators=(",", ":")) + "\n")
+        for s in samples:
+            rec = {
+                "image_path": s.image_path,
+                "mask_path": s.mask_path,
+                "label_path": s.label_path,
+                "category": s.category,
+                "base_name": s.base_name,
+                "width": s.width,
+                "height": s.height,
+            }
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    logger.info(f"Saved validation cache ({len(samples):,} samples) → {cache_path}")
+
+
+def _load_valid_samples_cache(cache_path: str, logger: logging.Logger) -> Tuple[Optional[List[Sample]], Optional[dict]]:
+    """Load validated samples from cache. Returns (samples, report_counters) or (None, None)."""
+    if not os.path.exists(cache_path):
+        return None, None
+    try:
+        samples: List[Sample] = []
+        report_data = None
+        with open(cache_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if rec.get("_type") == "report":
+                    report_data = rec
+                    continue
+                img_path = rec.get("image_path", "")
+                if not (img_path and os.path.exists(img_path)):
+                    continue
+                samples.append(Sample(
+                    image_path=img_path,
+                    mask_path=rec.get("mask_path", ""),
+                    label_path=rec.get("label_path", ""),
+                    category=rec["category"],
+                    base_name=rec["base_name"],
+                    width=int(rec.get("width", 0)),
+                    height=int(rec.get("height", 0)),
+                ))
+        if not samples:
+            return None, None
+        logger.info(f"Loaded validation cache: {len(samples):,} samples")
+        return samples, report_data
+    except Exception as e:
+        logger.warning(f"Could not load validation cache {cache_path}: {e}")
+        return None, None
+
+
 def _load_augmented_manifest(manifest_path: str, logger: logging.Logger) -> List[Sample]:
     """Load augmented samples saved from a previous run."""
     samples: List[Sample] = []
     if not os.path.exists(manifest_path):
         return samples
 
+    skipped = 0
     try:
         with open(manifest_path, "r") as f:
             for line in f:
@@ -189,7 +255,12 @@ def _load_augmented_manifest(manifest_path: str, logger: logging.Logger) -> List
                 rec = json.loads(line)
                 img_path = rec.get("image_path", "")
                 mask_path = rec.get("mask_path", "")
-                if not (img_path and mask_path and os.path.exists(img_path) and os.path.exists(mask_path)):
+                if not (img_path and mask_path):
+                    skipped += 1
+                    continue
+                # Check files still exist on disk (prev run may have been cleaned up)
+                if not (os.path.exists(img_path) and os.path.exists(mask_path)):
+                    skipped += 1
                     continue
                 samples.append(Sample(
                     image_path=img_path,
@@ -205,7 +276,8 @@ def _load_augmented_manifest(manifest_path: str, logger: logging.Logger) -> List
         logger.warning(f"Could not load augmentation manifest {manifest_path}: {e}")
         return []
 
-    logger.info(f"Loaded {len(samples):,} augmented samples from manifest")
+    logger.info(f"Loaded {len(samples):,} augmented samples from manifest"
+                + (f" (skipped {skipped} missing)" if skipped else ""))
     return samples
 
 
@@ -703,11 +775,26 @@ def apply_augmentation(
     return aug_img, aug_mask, valid_polygons
 
 
+def _write_polygons_as_yolo(label_path: str, polygons: List[List[float]], W: int, H: int):
+    """Write absolute polygons to YOLO-seg txt (normalized coords, class_id=0)."""
+    with open(label_path, "w") as f:
+        for poly in polygons:
+            if len(poly) < 6:
+                continue
+            parts = ["0"]
+            for i in range(0, len(poly), 2):
+                x = max(0.0, min(float(poly[i]) / max(W, 1), 1.0))
+                y = max(0.0, min(float(poly[i + 1]) / max(H, 1), 1.0))
+                parts.append(f"{x:.6f}")
+                parts.append(f"{y:.6f}")
+            f.write(" ".join(parts) + "\n")
+
+
 def _augment_worker(args) -> Tuple[bool, str, Optional[dict]]:
     """
     Per-sample augmentation worker.
     Returns (success, img_path, result_dict | None).
-    result_dict: {aug_img_path, aug_mask_path, polygons, W, H}
+    result_dict: {aug_img_path, aug_mask_path, aug_label_path, W, H}
     """
     sample_dict, out_root, min_pixels = args
 
@@ -759,17 +846,19 @@ def _augment_worker(args) -> Tuple[bool, str, Optional[dict]]:
 
         aug_img_path  = os.path.join(out_dir, f"{aug_base}{ext}")
         aug_mask_path = os.path.join(out_dir, f"{aug_base}.png")
+        aug_label_path = os.path.join(out_dir, f"{aug_base}.txt")
 
         aug_img_bgr = cv2.cvtColor(aug_img_rgb, cv2.COLOR_RGB2BGR)
         cv2.imwrite(aug_img_path,  aug_img_bgr)
         cv2.imwrite(aug_mask_path, aug_mask)
+        _write_polygons_as_yolo(aug_label_path, aug_polygons, aug_W, aug_H)
 
         return True, img_path, {
             "aug_img_path":  aug_img_path,
             "aug_mask_path": aug_mask_path,
+            "aug_label_path": aug_label_path,
             "category":      category,
             "base_name":     aug_base,
-            "polygons":      aug_polygons,
             "W": aug_W,
             "H": aug_H,
         }
@@ -852,12 +941,12 @@ def augment_samples(
                     sample = Sample(
                         image_path=result["aug_img_path"],
                         mask_path=result["aug_mask_path"],
-                        label_path="",
+                        label_path=result["aug_label_path"],
                         category=result["category"],
                         base_name=result["base_name"],
                         width=result["W"],
                         height=result["H"],
-                        polygons=result["polygons"],   # carry augmented polygons forward
+                        polygons=None,
                     )
                     aug_samples.append(sample)
 
@@ -1253,32 +1342,52 @@ def main():
         elapsed = time.time() - t_start
         logger.info(f"[Stage {completed_stages}/{total_stages}] {stage_name} done in {elapsed:.1f}s")
 
-    # ── 1. Discover ───────────────────────────────────────────────────────
-    t_stage = time.time()
-    samples = discover_samples(cfg.input_dir, logger)
-    if not samples:
-        logger.error("No samples found. Check --input path.")
-        sys.exit(1)
-    _stage_done("Discovery", t_stage)
+    # ── 1 & 2. Discover + Validate (or load cache on resume) ─────────────
+    valid_cache_path = os.path.join(cfg.output_dir, "_valid_samples_cache.jsonl")
+    valid_samples: Optional[List[Sample]] = None
 
-    # ── Debug limit ───────────────────────────────────────────────────────
-    if args.limit > 0:
-        random.seed(cfg.seed)
-        random.shuffle(samples)
-        samples = samples[:args.limit]
-        logger.info(f"Debug mode: limited to {len(samples):,} samples")
+    if args.resume:
+        cached, cached_report = _load_valid_samples_cache(valid_cache_path, logger)
+        if cached:
+            valid_samples = cached
+            # Restore report counters from cache
+            if cached_report:
+                report.total_found = cached_report.get("total_found", 0)
+                report.valid = cached_report.get("valid", 0)
+                report.removed_missing = cached_report.get("removed_missing", 0)
+                report.removed_corrupted = cached_report.get("removed_corrupted", 0)
+                report.removed_small_mask = cached_report.get("removed_small_mask", 0)
+                report.removed_invalid_label = cached_report.get("removed_invalid_label", 0)
+            completed_stages = 2
+            logger.info(f"[Stage 1-2/6] Loaded {len(valid_samples):,} validated samples from cache (skipped discovery+validation)")
 
-    # ── 2. Validate ───────────────────────────────────────────────────────
-    t_stage = time.time()
-    valid_samples = validate_samples(samples, cfg, logger, report)
-    if not valid_samples:
-        logger.error("No valid samples after validation.")
-        sys.exit(1)
-    _stage_done("Validation", t_stage)
+    if valid_samples is None:
+        t_stage = time.time()
+        samples = discover_samples(cfg.input_dir, logger)
+        if not samples:
+            logger.error("No samples found. Check --input path.")
+            sys.exit(1)
+        _stage_done("Discovery", t_stage)
 
-    # Release discovery list before memory-heavy augmentation stage.
-    del samples
-    gc.collect()
+        # ── Debug limit ───────────────────────────────────────────────────
+        if args.limit > 0:
+            random.seed(cfg.seed)
+            random.shuffle(samples)
+            samples = samples[:args.limit]
+            logger.info(f"Debug mode: limited to {len(samples):,} samples")
+
+        t_stage = time.time()
+        valid_samples = validate_samples(samples, cfg, logger, report)
+        if not valid_samples:
+            logger.error("No valid samples after validation.")
+            sys.exit(1)
+        _stage_done("Validation", t_stage)
+
+        # Save cache for future resume runs
+        _save_valid_samples_cache(valid_samples, valid_cache_path, report, logger)
+
+        del samples
+        gc.collect()
 
     if args.dry_run:
         logger.info("Dry run complete. No files copied.")
@@ -1303,16 +1412,17 @@ def main():
     build_dataset(all_samples, cfg.output_dir, cfg, logger, report)
     _stage_done("COCO Build", t_stage)
 
-    # ── 5. Cleanup augmentation temp dir ──────────────────────────────────
+    # ── 5. Cleanup temp files (only after COCO build succeeded) ────────────
     t_stage = time.time()
     aug_temp = os.path.join(cfg.output_dir, "_augmented_temp")
     aug_manifest = os.path.join(cfg.output_dir, "_augmented_manifest.jsonl")
-    if os.path.isdir(aug_temp):
-        shutil.rmtree(aug_temp, ignore_errors=True)
-        logger.info("Cleaned up _augmented_temp")
-    if os.path.exists(aug_manifest):
-        os.remove(aug_manifest)
-        logger.info("Cleaned up _augmented_manifest.jsonl")
+    for tmp_path in [aug_temp, aug_manifest, valid_cache_path]:
+        if os.path.isdir(tmp_path):
+            shutil.rmtree(tmp_path, ignore_errors=True)
+            logger.info(f"Cleaned up {os.path.basename(tmp_path)}")
+        elif os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+            logger.info(f"Cleaned up {os.path.basename(tmp_path)}")
     _stage_done("Cleanup", t_stage)
 
     # ── 6. Report ─────────────────────────────────────────────────────────
