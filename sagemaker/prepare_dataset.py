@@ -54,6 +54,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Set
 
+import ctypes
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -61,6 +62,17 @@ from tqdm import tqdm
 # Keep OpenCV from spawning large thread pools in each worker process.
 cv2.setNumThreads(1)
 cv2.ocl.setUseOpenCL(False)
+
+
+def _release_memory():
+    """Force Python + OS to actually free unused heap pages.
+    Python's allocator keeps freed arenas; malloc_trim gives them back."""
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # macOS / non-glibc — gc.collect() alone is fine
 
 # ── Fast JSON writer (3-5× faster than stdlib for large COCO files) ──────────
 try:
@@ -1124,11 +1136,10 @@ def write_coco_split_streaming(
     then assembles final COCO JSON without keeping huge lists in RAM.
     Returns (num_images, num_annotations).
     """
-    worker_args = [
-        (s.image_path, s.label_path, s.category, s.base_name,
-         s.width, s.height, s.polygons)
-        for s in samples
-    ]
+    def _coco_args_iter():
+        for s in samples:
+            yield (s.image_path, s.label_path, s.category, s.base_name,
+                   s.width, s.height, s.polygons)
 
     images_jsonl = f"{json_path}.images.jsonl"
     anns_jsonl = f"{json_path}.anns.jsonl"
@@ -1137,12 +1148,14 @@ def write_coco_split_streaming(
     ann_id = 1
     num_images = 0
     num_anns = 0
+    total = len(samples)
 
+    mp_ctx = multiprocessing.get_context("forkserver")
     with open(images_jsonl, "w") as img_f, open(anns_jsonl, "w") as ann_f:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
             for result in tqdm(
-                ex.map(_build_coco_worker, worker_args, chunksize=64),
-                total=len(worker_args), desc=desc,
+                ex.map(_build_coco_worker, _coco_args_iter(), chunksize=32),
+                total=total, desc=desc,
             ):
                 if result is None:
                     continue
@@ -1210,6 +1223,7 @@ def build_dataset(
       3. Copy images into images/train|val/<category>/
       4. Build COCO JSON in parallel → annotations/instances_train|val.json
     """
+    _release_memory()
     logger.info(f"Building COCO dataset from {len(all_samples):,} samples ...")
     random.seed(cfg.seed)
 
@@ -1235,33 +1249,48 @@ def build_dataset(
         train_samples.extend(cat_list[n_val:])
         report.by_category[cat] = len(cat_list)
 
+    # Free the intermediate structures
+    del by_cat, all_samples
+    _release_memory()
+
     report.train_count = len(train_samples)
     report.val_count   = len(val_samples)
     logger.info(f"Split: {len(train_samples):,} train | {len(val_samples):,} val")
 
-    # ── 3. Pre-create all output directories in one pass ───────────────
+    # ── 3. Copy images — use hardlinks, stream in batches ─────────────
+    # Pre-create directories first, then stream copy tasks through executor
+    # to avoid materialising the full list in memory.
     dirs_needed: Set[str] = set()
-    copy_tasks = []
+    total_copy = len(train_samples) + len(val_samples)
+    # Build dirs set (cheap — just strings)
     for split, split_samples in [("train", train_samples), ("val", val_samples)]:
         for s in split_samples:
-            ext     = Path(s.image_path).suffix
-            img_dst = os.path.join(output_dir, "images", split,
-                                   s.category, f"{s.base_name}{ext}")
-            copy_tasks.append((s.image_path, img_dst))
-            dirs_needed.add(os.path.dirname(img_dst))
-
+            dirs_needed.add(
+                os.path.join(output_dir, "images", split, s.category)
+            )
     for d in dirs_needed:
         os.makedirs(d, exist_ok=True)
+    del dirs_needed
 
+    def _copy_task_iter():
+        for split, split_samples in [("train", train_samples), ("val", val_samples)]:
+            for s in split_samples:
+                ext = Path(s.image_path).suffix
+                img_dst = os.path.join(output_dir, "images", split,
+                                       s.category, f"{s.base_name}{ext}")
+                yield (s.image_path, img_dst)
+
+    mp_ctx = multiprocessing.get_context("forkserver")
     ok = 0
-    with ProcessPoolExecutor(max_workers=cfg.workers) as ex:
+    with ProcessPoolExecutor(max_workers=cfg.workers, mp_context=mp_ctx) as ex:
         for success in tqdm(
-            ex.map(_copy_image_worker, copy_tasks, chunksize=128),
-            total=len(copy_tasks), desc="Copying images",
+            ex.map(_copy_image_worker, _copy_task_iter(), chunksize=128),
+            total=total_copy, desc="Copying images",
         ):
             if success:
                 ok += 1
-    logger.info(f"Copied {ok:,}/{len(copy_tasks):,} images")
+    logger.info(f"Copied {ok:,}/{total_copy:,} images")
+    _release_memory()
 
     # ── 4. Build COCO JSONs ───────────────────────────────────────────────
     ann_dir = os.path.join(output_dir, "annotations")
@@ -1281,6 +1310,7 @@ def build_dataset(
             desc=f"COCO {split}",
         )
         logger.info(f"  ↳ {json_path}  |  {n_imgs:,} images  |  {n_anns:,} annotations")
+        _release_memory()
 
 
 # ─────────────────────────── MAIN ───────────────────────────────────────────
@@ -1426,7 +1456,13 @@ def main():
     # ── 4. Build COCO dataset ─────────────────────────────────────────────
     t_stage = time.time()
     all_samples = valid_samples + aug_samples
+    # Free the separate lists — build_dataset only needs all_samples
+    del valid_samples, aug_samples
+    _release_memory()
+    logger.info(f"Memory released before COCO build (RSS will drop after malloc_trim)")
     build_dataset(all_samples, cfg.output_dir, cfg, logger, report)
+    del all_samples
+    _release_memory()
     _stage_done("COCO Build", t_stage)
 
     # ── 5. Cleanup temp files (only after COCO build succeeded) ────────────
