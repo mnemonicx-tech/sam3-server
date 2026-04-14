@@ -45,6 +45,7 @@ import logging
 import argparse
 import random
 import time
+import inspect
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
@@ -80,6 +81,7 @@ class Config:
     val_split: float = 0.20          # validation fraction
 
     workers: int = 4                 # parallel workers
+    aug_workers: int = 2             # separate workers for augmentation (memory heavy)
     min_mask_area_ratio: float = 0.002
     min_mask_pixels: int = 500
     min_polygon_points: int = 3
@@ -365,6 +367,75 @@ def polygon_to_coco(
 
 # ─────────────────────────── STEP 3: AUGMENTATION ───────────────────────────
 
+def _supports_kwarg(transform_cls, kwarg: str) -> bool:
+    """Return True if a transform constructor supports the given kwarg."""
+    try:
+        return kwarg in inspect.signature(transform_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _make_perspective():
+    kwargs = {
+        "scale": (0.02, 0.035),
+        "keep_size": True,
+        "p": 0.25,
+    }
+    if _supports_kwarg(A.Perspective, "border_mode"):
+        kwargs["border_mode"] = cv2.BORDER_REFLECT_101
+    elif _supports_kwarg(A.Perspective, "pad_mode"):
+        kwargs["pad_mode"] = cv2.BORDER_REFLECT_101
+    return A.Perspective(**kwargs)
+
+
+def _make_image_compression():
+    if _supports_kwarg(A.ImageCompression, "quality_range"):
+        return A.ImageCompression(quality_range=(70, 100), p=0.20)
+    return A.ImageCompression(quality_lower=70, quality_upper=100, p=0.20)
+
+
+def _make_small_affine():
+    kwargs = {
+        "scale": (0.90, 1.10),
+        "translate_percent": (-0.06, 0.06),
+        "rotate": (0.0, 0.0),
+        "p": 0.30,
+    }
+    if _supports_kwarg(A.Affine, "border_mode"):
+        kwargs["border_mode"] = cv2.BORDER_REFLECT_101
+    elif _supports_kwarg(A.Affine, "mode"):
+        kwargs["mode"] = cv2.BORDER_REFLECT_101
+    return A.Affine(**kwargs)
+
+
+def _make_gauss_noise():
+    # Albumentations v2 uses std_range/mean_range; v1 uses var_limit.
+    if _supports_kwarg(A.GaussNoise, "std_range"):
+        return A.GaussNoise(std_range=(0.04, 0.12), mean_range=(0.0, 0.0), p=0.20)
+    return A.GaussNoise(var_limit=(10.0, 40.0), p=0.20)
+
+
+def _make_coarse_dropout():
+    # Albumentations v2 switched to *_range + fill.
+    if _supports_kwarg(A.CoarseDropout, "num_holes_range"):
+        return A.CoarseDropout(
+            num_holes_range=(1, 6),
+            hole_height_range=(0.02, 0.06),
+            hole_width_range=(0.02, 0.06),
+            fill=128,
+            p=0.12,
+        )
+    return A.CoarseDropout(
+        max_holes=6,
+        max_height=32,
+        max_width=32,
+        min_holes=1,
+        min_height=12,
+        min_width=12,
+        fill_value=128,
+        p=0.12,
+    )
+
 def _build_transform(W: int, H: int):
     """
     Domain-generalization augmentation pipeline for Myntra catalog → real-world.
@@ -389,22 +460,11 @@ def _build_transform(W: int, H: int):
 
             # Mild perspective warp: simulates phone held at slight angles.
             # limit=0.03 keeps garment shape intact (< 3% foreshortening).
-            A.Perspective(
-                scale=(0.02, 0.035),
-                keep_size=True,
-                pad_mode=cv2.BORDER_REFLECT_101,
-                p=0.25,
-            ),
+            _make_perspective(),
 
             # Small shift + scale: subject not always centered / same distance.
-            # rotate_limit=0 here — rotation handled separately below.
-            A.ShiftScaleRotate(
-                shift_limit=0.06,       # up to 6% translation
-                scale_limit=0.10,       # 90-110% zoom
-                rotate_limit=0,
-                border_mode=cv2.BORDER_REFLECT_101,
-                p=0.30,
-            ),
+            # Implemented via Affine to avoid ShiftScaleRotate deprecation warnings.
+            _make_small_affine(),
 
             # Gentle rotation (±12°): phone tilt, slightly angled shots.
             # Anything >20° is unrealistic for fashion photos.
@@ -466,13 +526,13 @@ def _build_transform(W: int, H: int):
 
             # JPEG compression: social-media re-compression artifacts.
             # quality_lower=70 matches WhatsApp / Instagram compression.
-            A.ImageCompression(quality_lower=70, quality_upper=100, p=0.20),
+            _make_image_compression(),
 
             # ── 4. SENSOR NOISE (pixel-only) ──────────────────────────────
 
             # Gaussian noise: ISO noise from phone sensors in low light.
             # var_limit 10-40 matches real phone ISO 400-1600 graininess.
-            A.GaussNoise(var_limit=(10.0, 40.0), p=0.20),
+            _make_gauss_noise(),
 
             # ── 5. BACKGROUND DISRUPTION (pixel-only) ─────────────────────
             # Studio white backgrounds are the #1 overfitting risk.
@@ -497,16 +557,7 @@ def _build_transform(W: int, H: int):
             # Small holes only — never more than 5% of image area.
             # fill_value=128 (neutral gray) avoids stark black-on-white artifacts
             # that the model could overfit to as a shortcut signal.
-            A.CoarseDropout(
-                max_holes=6,
-                max_height=int(H * 0.06),
-                max_width=int(W * 0.06),
-                min_holes=1,
-                min_height=int(H * 0.02),
-                min_width=int(W * 0.02),
-                fill_value=128,
-                p=0.12,
-            ),
+            _make_coarse_dropout(),
         ],
         keypoint_params=A.KeypointParams(
             format="xy",
@@ -722,9 +773,11 @@ def augment_samples(
     aug_samples: List[Sample] = []
     ok_count = 0
 
-    with ProcessPoolExecutor(max_workers=cfg.workers) as ex:
+    aug_workers = max(1, min(cfg.aug_workers, cfg.workers))
+    logger.info(f"Augmentation workers: {aug_workers}")
+    with ProcessPoolExecutor(max_workers=aug_workers) as ex:
         for ok, _, result in tqdm(
-            ex.map(_augment_worker, worker_args, chunksize=32),
+            ex.map(_augment_worker, worker_args, chunksize=16),
             total=len(worker_args), desc="Augmenting",
         ):
             if ok and result:
@@ -996,12 +1049,14 @@ def parse_args():
                    help="Input dir (hyperstack.py output_data)")
     p.add_argument("--output",          default="training_data",
                    help="Output COCO dataset dir")
-    p.add_argument("--aug-ratio",       type=float, default=0.25,
+    p.add_argument("--aug-ratio",       type=float, default=0.12,
                    help="Fraction per category to augment (0–1)")
     p.add_argument("--val-split",       type=float, default=0.20,
                    help="Validation fraction (0–1)")
     p.add_argument("--workers",         type=int,   default=4,
                    help="Parallel workers (match CPU core count)")
+    p.add_argument("--aug-workers",     type=int,   default=2,
+                   help="Workers for augmentation stage (lower saves RAM)")
     p.add_argument("--min-mask-ratio",  type=float, default=0.002,
                    help="Min mask area / image area")
     p.add_argument("--min-mask-pixels", type=int,   default=500,
@@ -1024,6 +1079,7 @@ def main():
         aug_ratio=args.aug_ratio,
         val_split=args.val_split,
         workers=args.workers,
+        aug_workers=args.aug_workers,
         min_mask_area_ratio=args.min_mask_ratio,
         min_mask_pixels=args.min_mask_pixels,
         seed=args.seed,
@@ -1039,7 +1095,10 @@ def main():
     logger.info("=" * 62)
     logger.info(f"Input  : {cfg.input_dir}")
     logger.info(f"Output : {cfg.output_dir}")
-    logger.info(f"Workers: {cfg.workers}  |  Aug: {cfg.aug_ratio}  |  Val: {cfg.val_split}")
+    logger.info(
+        f"Workers: {cfg.workers}  |  Aug workers: {cfg.aug_workers}  |  "
+        f"Aug: {cfg.aug_ratio}  |  Val: {cfg.val_split}"
+    )
 
     total_stages = 6
     completed_stages = 0
