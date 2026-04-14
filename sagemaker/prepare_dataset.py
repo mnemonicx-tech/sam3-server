@@ -74,6 +74,49 @@ def _release_memory():
     except (OSError, AttributeError):
         pass  # macOS / non-glibc — gc.collect() alone is fine
 
+
+def _bounded_map(executor, fn, iterable, max_inflight=64, desc=None, total=None):
+    """
+    Like executor.map() but limits in-flight futures to max_inflight.
+
+    executor.map() materializes ALL futures upfront — with 300K items that means
+    300K Future objects + 300K result dicts in memory simultaneously.
+    This submits only max_inflight tasks at a time, yielding results in order
+    so memory stays bounded (~max_inflight results × result size).
+    """
+    from collections import deque
+    it = iter(iterable)
+    pending: deque = deque()   # FIFO of Future objects, preserves submission order
+
+    # Prime the queue
+    for _ in range(max_inflight):
+        try:
+            args = next(it)
+        except StopIteration:
+            break
+        pending.append(executor.submit(fn, args))
+
+    completed = 0
+    pbar = tqdm(total=total, desc=desc, unit="img") if desc else None
+    while pending:
+        fut = pending.popleft()
+        result = fut.result()     # block until this (oldest) future is done
+        yield result
+        completed += 1
+        if pbar:
+            pbar.update(1)
+
+        # Refill: submit one more task for each result consumed
+        try:
+            args = next(it)
+            pending.append(executor.submit(fn, args))
+        except StopIteration:
+            pass
+
+    if pbar:
+        pbar.close()
+
+
 # ── Fast JSON writer (3-5× faster than stdlib for large COCO files) ──────────
 try:
     import orjson
@@ -1014,9 +1057,10 @@ def augment_samples(
     mp_ctx = multiprocessing.get_context("forkserver")
     with open(manifest_path, "a") as manifest_f:
         with ProcessPoolExecutor(max_workers=aug_workers, mp_context=mp_ctx) as ex:
-            for ok, _, result in tqdm(
-                ex.map(_augment_worker, _worker_args_iter(), chunksize=4),
-                total=total_tasks, desc="Augmenting",
+            for ok, _, result in _bounded_map(
+                ex, _augment_worker, _worker_args_iter(),
+                max_inflight=aug_workers * 4,
+                desc="Augmenting", total=total_tasks,
             ):
                 if ok and result:
                     ok_count += 1
@@ -1189,9 +1233,10 @@ def write_coco_split_streaming(
     mp_ctx = multiprocessing.get_context("forkserver")
     with open(images_jsonl, "w") as img_f, open(anns_jsonl, "w") as ann_f:
         with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
-            for result in tqdm(
-                ex.map(_build_coco_worker, sample_iter, chunksize=32),
-                total=total, desc=desc,
+            for result in _bounded_map(
+                ex, _build_coco_worker, sample_iter,
+                max_inflight=workers * 8,
+                desc=desc, total=total,
             ):
                 if result is None:
                     continue
@@ -1229,17 +1274,24 @@ def write_coco_split_streaming(
 
 
 def _copy_image_worker(args) -> bool:
-    """Copy image — try hardlink first (instant, zero IO) then fallback to copy."""
+    """Link image into output tree — symlink (zero space), hardlink, or copy."""
     img_src, img_dst = args
     try:
-        # Dir creation is batched before this is called, but guard just in case
+        if not os.path.exists(img_src):
+            return False
+        # If destination already exists (re-run), skip
+        if os.path.exists(img_dst):
+            return True
         dst_dir = os.path.dirname(img_dst)
         if not os.path.isdir(dst_dir):
             os.makedirs(dst_dir, exist_ok=True)
         try:
-            os.link(img_src, img_dst)      # hardlink = instant, shares inode
+            os.symlink(os.path.abspath(img_src), img_dst)  # symlink = zero disk space
         except (OSError, PermissionError):
-            shutil.copy2(img_src, img_dst)  # cross-device fallback
+            try:
+                os.link(img_src, img_dst)                  # hardlink = shares inode
+            except (OSError, PermissionError):
+                shutil.copy2(img_src, img_dst)             # copy = last resort
         return True
     except Exception:
         return False
@@ -1326,9 +1378,10 @@ def build_dataset(
     mp_ctx = multiprocessing.get_context("forkserver")
     ok = 0
     with ProcessPoolExecutor(max_workers=cfg.workers, mp_context=mp_ctx) as ex:
-        for success in tqdm(
-            ex.map(_copy_image_worker, _copy_arg_iter(), chunksize=128),
-            total=total_count, desc="Copying images",
+        for success in _bounded_map(
+            ex, _copy_image_worker, _copy_arg_iter(),
+            max_inflight=cfg.workers * 32,
+            desc="Copying images", total=total_count,
         ):
             if success:
                 ok += 1
@@ -1400,6 +1453,8 @@ def parse_args():
                    help="Run discovery + validation only, no copy/build")
     p.add_argument("--resume",          action="store_true",
                    help="Resume from existing augmentation manifest when available")
+    p.add_argument("--clean",           action="store_true",
+                   help="Delete all caches, temp files, and previous output before running")
     p.add_argument("--seed",            type=int,   default=42)
     return p.parse_args()
 
@@ -1420,6 +1475,24 @@ def main():
     )
 
     os.makedirs(cfg.output_dir, exist_ok=True)
+
+    # ── --clean: wipe everything and start fresh ──────────────────────────
+    if args.clean:
+        for name in (
+            "_valid_samples_cache.jsonl",
+            "_augmented_manifest.jsonl",
+            "_augmented_temp",
+            "images",
+            "annotations",
+            "pipeline_report.json",
+        ):
+            target = os.path.join(cfg.output_dir, name)
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            elif os.path.isfile(target):
+                os.remove(target)
+        print(f"Cleaned output directory: {cfg.output_dir}")
+
     logger = setup_logging(cfg.output_dir)
     report = PipelineReport()
     t0     = time.time()
