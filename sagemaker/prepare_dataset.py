@@ -47,6 +47,7 @@ import random
 import time
 import inspect
 import gc
+import multiprocessing
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
@@ -905,35 +906,51 @@ def augment_samples(
             selected = [s for s in selected if (s.category, s.base_name) not in done_source_keys]
         to_augment.extend(selected)
 
+    # ── Free large structures before forking workers ─────────────────────
+    # ProcessPoolExecutor uses fork() on Linux; each worker inherits the
+    # parent's address space.  Python ref-counting forces copy-on-write
+    # page faults, so every extra MB here is duplicated N-workers times.
+    del by_cat, done_source_keys
+    gc.collect()
+
     logger.info(f"Augmenting {len(to_augment):,} samples "
                 f"({cfg.aug_ratio * 100:.0f}% per category) using albumentations keypoint API ...")
 
     total_tasks = len(to_augment)
 
-    def _worker_args_iter():
-        for s in to_augment:
-            yield (
-                {
-                    "image_path": s.image_path,
-                    "mask_path": s.mask_path,
-                    "label_path": s.label_path,
-                    "category": s.category,
-                    "base_name": s.base_name,
-                    "aug_seed": cfg.seed + hash(s.base_name) % (2**31),
-                },
-                out_root,
-                cfg.min_mask_pixels,
-            )
+    # Pre-materialise worker args as lightweight dicts so the generator
+    # doesn't keep Sample objects alive during iteration.
+    worker_args = [
+        (
+            {
+                "image_path": s.image_path,
+                "mask_path": s.mask_path,
+                "label_path": s.label_path,
+                "category": s.category,
+                "base_name": s.base_name,
+                "aug_seed": cfg.seed + hash(s.base_name) % (2**31),
+            },
+            out_root,
+            cfg.min_mask_pixels,
+        )
+        for s in to_augment
+    ]
+    del to_augment
+    gc.collect()
 
-    aug_samples: List[Sample] = existing_aug_samples[:]
+    aug_samples: List[Sample] = existing_aug_samples
+    del existing_aug_samples
     ok_count = 0
 
     aug_workers = max(1, min(cfg.aug_workers, cfg.workers))
     logger.info(f"Augmentation workers: {aug_workers}")
+    # Use forkserver so workers start clean instead of inheriting the
+    # parent's ~2-3 GB address space (306K Sample objects, etc.).
+    mp_ctx = multiprocessing.get_context("forkserver")
     with open(manifest_path, "a") as manifest_f:
-        with ProcessPoolExecutor(max_workers=aug_workers) as ex:
+        with ProcessPoolExecutor(max_workers=aug_workers, mp_context=mp_ctx) as ex:
             for ok, _, result in tqdm(
-                ex.map(_augment_worker, _worker_args_iter(), chunksize=16),
+                ex.map(_augment_worker, iter(worker_args), chunksize=4),
                 total=total_tasks, desc="Augmenting",
             ):
                 if ok and result:
