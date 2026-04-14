@@ -173,12 +173,8 @@ def discover_samples(input_dir: str, logger: logging.Logger) -> List[Sample]:
     samples: List[Sample] = []
     input_path = Path(input_dir)
 
-    for category_dir in sorted(input_path.iterdir()):
-        if not category_dir.is_dir():
-            continue
-        if category_dir.name.startswith("_"):  # skip _failed, _augmented_temp, etc.
-            continue
-
+    category_dirs = [p for p in sorted(input_path.iterdir()) if p.is_dir() and not p.name.startswith("_")]
+    for category_dir in tqdm(category_dirs, desc="Discovering", unit="cat"):
         category = category_dir.name
         for img_file in sorted(category_dir.iterdir()):
             if img_file.suffix.lower() not in (".jpg", ".jpeg", ".webp"):
@@ -394,7 +390,7 @@ def _build_transform(W: int, H: int):
             # Mild perspective warp: simulates phone held at slight angles.
             # limit=0.03 keeps garment shape intact (< 3% foreshortening).
             A.Perspective(
-                scale=(0.02, 0.04),
+                scale=(0.02, 0.035),
                 keep_size=True,
                 pad_mode=cv2.BORDER_REFLECT_101,
                 p=0.25,
@@ -423,8 +419,8 @@ def _build_transform(W: int, H: int):
             # Brightness + contrast swing: overexposed windows, dim rooms.
             # Studio images are perfectly lit; real scenes vary ±25%.
             A.RandomBrightnessContrast(
-                brightness_limit=0.25,
-                contrast_limit=0.20,
+                brightness_limit=0.30,
+                contrast_limit=0.25,
                 p=0.50,
             ),
 
@@ -453,6 +449,13 @@ def _build_transform(W: int, H: int):
                 r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.10
             ),
 
+            A.ColorJitter(
+                brightness=0.1,
+                contrast=0.1,
+                saturation=0.15,
+                hue=0.05,
+                p=0.15,
+            ),
             # ── 3. CAMERA IMPERFECTIONS (pixel-only) ──────────────────────
 
             # Gaussian blur: slightly out-of-focus phone cameras.
@@ -1038,11 +1041,22 @@ def main():
     logger.info(f"Output : {cfg.output_dir}")
     logger.info(f"Workers: {cfg.workers}  |  Aug: {cfg.aug_ratio}  |  Val: {cfg.val_split}")
 
+    total_stages = 6
+    completed_stages = 0
+
+    def _stage_done(stage_name: str, t_start: float):
+        nonlocal completed_stages
+        completed_stages += 1
+        elapsed = time.time() - t_start
+        logger.info(f"[Stage {completed_stages}/{total_stages}] {stage_name} done in {elapsed:.1f}s")
+
     # ── 1. Discover ───────────────────────────────────────────────────────
+    t_stage = time.time()
     samples = discover_samples(cfg.input_dir, logger)
     if not samples:
         logger.error("No samples found. Check --input path.")
         sys.exit(1)
+    _stage_done("Discovery", t_stage)
 
     # ── Debug limit ───────────────────────────────────────────────────────
     if args.limit > 0:
@@ -1052,10 +1066,12 @@ def main():
         logger.info(f"Debug mode: limited to {len(samples):,} samples")
 
     # ── 2. Validate ───────────────────────────────────────────────────────
+    t_stage = time.time()
     valid_samples = validate_samples(samples, cfg, logger, report)
     if not valid_samples:
         logger.error("No valid samples after validation.")
         sys.exit(1)
+    _stage_done("Validation", t_stage)
 
     if args.dry_run:
         logger.info("Dry run complete. No files copied.")
@@ -1065,26 +1081,34 @@ def main():
         return
 
     # ── 3. Augment ────────────────────────────────────────────────────────
+    t_stage = time.time()
     aug_samples: List[Sample] = []
     if not args.no_aug:
         aug_temp = os.path.join(cfg.output_dir, "_augmented_temp")
         aug_samples = augment_samples(valid_samples, cfg, aug_temp, logger, report)
     else:
         logger.info("Augmentation skipped (--no-aug)")
+    _stage_done("Augmentation", t_stage)
 
     # ── 4. Build COCO dataset ─────────────────────────────────────────────
+    t_stage = time.time()
     all_samples = valid_samples + aug_samples
     build_dataset(all_samples, cfg.output_dir, cfg, logger, report)
+    _stage_done("COCO Build", t_stage)
 
     # ── 5. Cleanup augmentation temp dir ──────────────────────────────────
+    t_stage = time.time()
     aug_temp = os.path.join(cfg.output_dir, "_augmented_temp")
     if os.path.isdir(aug_temp):
         shutil.rmtree(aug_temp, ignore_errors=True)
         logger.info("Cleaned up _augmented_temp")
+    _stage_done("Cleanup", t_stage)
 
     # ── 6. Report ─────────────────────────────────────────────────────────
+    t_stage = time.time()
     report_path = os.path.join(cfg.output_dir, "pipeline_report.json")
     report.save(report_path)
+    _stage_done("Report", t_stage)
 
     elapsed = time.time() - t0
     logger.info("=" * 62)
