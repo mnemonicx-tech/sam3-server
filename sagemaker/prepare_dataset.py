@@ -294,6 +294,56 @@ def _load_augmented_manifest(manifest_path: str, logger: logging.Logger) -> List
     return samples
 
 
+def _stream_jsonl_samples(file_path: str):
+    """
+    Generator — yields (img_path, mask_path, label_path, category, base_name, w, h, polygons)
+    one record at a time directly from a JSONL file (valid_cache or aug_manifest).
+    Never builds a list; peak extra memory = one parsed dict per iteration.
+    """
+    if not os.path.exists(file_path):
+        return
+    with open(file_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if rec.get("_type") == "report":   # header line in valid cache
+                    continue
+                img = rec.get("image_path", "")
+                if not img:
+                    continue
+                yield (
+                    img,
+                    rec.get("mask_path", ""),
+                    rec.get("label_path", ""),
+                    rec.get("category", ""),
+                    rec.get("base_name", ""),
+                    int(rec.get("width", 0)),
+                    int(rec.get("height", 0)),
+                    rec.get("polygons"),
+                )
+            except Exception:
+                continue
+
+
+def _read_cache_header(cache_path: str, logger: logging.Logger) -> Optional[dict]:
+    """Read only the first (report) line from the validation cache — O(1) memory."""
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r") as f:
+            first_line = f.readline().strip()
+        if first_line:
+            rec = json.loads(first_line)
+            if rec.get("_type") == "report":
+                return rec
+    except Exception as e:
+        logger.warning(f"Could not read cache header {cache_path}: {e}")
+    return None
+
+
 # ─────────────────────────── STEP 1: DISCOVER ───────────────────────────────
 
 def discover_samples(input_dir: str, logger: logging.Logger) -> List[Sample]:
@@ -880,124 +930,114 @@ def _augment_worker(args) -> Tuple[bool, str, Optional[dict]]:
 
 
 def augment_samples(
-    valid_samples: List[Sample],
+    valid_cache_path: str,
     cfg: Config,
     out_root: str,
     logger: logging.Logger,
     report: PipelineReport,
     resume: bool = False,
-) -> List[Sample]:
-    """Stratified selection + parallel augmentation. Returns new Sample list."""
+) -> None:
+    """
+    Stratified selection + parallel augmentation.
+    Streams from valid_cache_path (never loads all samples into a list).
+    Writes augmented records to _augmented_manifest.jsonl.
+    Updates report.augmented in-place.
+    """
     if not HAS_ALBUMENTATIONS:
         logger.warning("albumentations not installed. Skipping augmentation.")
-        return []
-
-    random.seed(cfg.seed)
-    by_cat: Dict[str, List[Sample]] = defaultdict(list)
-    for s in valid_samples:
-        by_cat[s.category].append(s)
+        return
 
     manifest_path = os.path.join(os.path.dirname(out_root), "_augmented_manifest.jsonl")
-    existing_aug_samples: List[Sample] = []
     done_source_keys: Set[Tuple[str, str]] = set()
 
     if resume and os.path.exists(manifest_path):
-        existing_aug_samples = _load_augmented_manifest(manifest_path, logger)
-        # Manifest uses aug_ prefixed base_name; map back to original source base.
-        for s in existing_aug_samples:
-            src_base = s.base_name[4:] if s.base_name.startswith("aug_") else s.base_name
-            done_source_keys.add((s.category, src_base))
+        # Stream manifest — only need (category, base_name) pairs
+        for _, _, _, cat, base, _, _, _ in _stream_jsonl_samples(manifest_path):
+            src_base = base[4:] if base.startswith("aug_") else base
+            done_source_keys.add((cat, src_base))
         if done_source_keys:
             logger.info(f"Resume mode: {len(done_source_keys):,} augmentation items already completed")
 
-    to_augment: List[Sample] = []
-    for cat, cat_samples in by_cat.items():
-        n = max(1, int(len(cat_samples) * cfg.aug_ratio))
-        selected = random.sample(cat_samples, min(n, len(cat_samples)))
-        if done_source_keys:
-            selected = [s for s in selected if (s.category, s.base_name) not in done_source_keys]
-        to_augment.extend(selected)
+    # ── Pass 1: stream cache → per-category base_name lists (strings only, ~12 MB) ──
+    random.seed(cfg.seed)
+    by_cat_names: Dict[str, List[str]] = defaultdict(list)
+    for _, _, _, cat, base, _, _, _ in _stream_jsonl_samples(valid_cache_path):
+        by_cat_names[cat].append(base)
 
-    # ── Free large structures before forking workers ─────────────────────
-    # ProcessPoolExecutor uses fork() on Linux; each worker inherits the
-    # parent's address space.  Python ref-counting forces copy-on-write
-    # page faults, so every extra MB here is duplicated N-workers times.
-    del by_cat, done_source_keys
-    gc.collect()
+    # Stratified selection — store only (cat, base_name) pairs
+    selected: Set[Tuple[str, str]] = set()
+    for cat, names in by_cat_names.items():
+        n = max(1, int(len(names) * cfg.aug_ratio))
+        picks = random.sample(names, min(n, len(names)))
+        for base in picks:
+            if (cat, base) not in done_source_keys:
+                selected.add((cat, base))
 
-    logger.info(f"Augmenting {len(to_augment):,} samples "
-                f"({cfg.aug_ratio * 100:.0f}% per category) using albumentations keypoint API ...")
+    total_tasks = len(selected)
+    total_already_done = len(done_source_keys)
+    del by_cat_names, done_source_keys
+    _release_memory()
 
-    total_tasks = len(to_augment)
+    logger.info(
+        f"Augmenting {total_tasks:,} new samples "
+        f"({cfg.aug_ratio * 100:.0f}% per category)"
+        + (f" — {total_already_done:,} already done (resume)" if total_already_done else "")
+    )
 
-    # Pre-materialise worker args as lightweight dicts so the generator
-    # doesn't keep Sample objects alive during iteration.
-    worker_args = [
-        (
-            {
-                "image_path": s.image_path,
-                "mask_path": s.mask_path,
-                "label_path": s.label_path,
-                "category": s.category,
-                "base_name": s.base_name,
-                "aug_seed": cfg.seed + hash(s.base_name) % (2**31),
-            },
-            out_root,
-            cfg.min_mask_pixels,
-        )
-        for s in to_augment
-    ]
-    del to_augment
-    gc.collect()
+    if total_tasks == 0:
+        logger.info("All augmentation items already completed.")
+        report.augmented = total_already_done
+        return
 
-    aug_samples: List[Sample] = existing_aug_samples
-    del existing_aug_samples
+    # ── Pass 2: stream cache again, yield worker args only for selected samples ──
+    # 'selected' is a small set (~36K tuples). The generator yields one dict at
+    # a time — no large list is ever held in memory.
+    def _worker_args_iter():
+        for img, mask, label, cat, base, _, _, _ in _stream_jsonl_samples(valid_cache_path):
+            if (cat, base) in selected:
+                yield (
+                    {
+                        "image_path": img,
+                        "mask_path":  mask,
+                        "label_path": label,
+                        "category":   cat,
+                        "base_name":  base,
+                        "aug_seed":   cfg.seed + hash(base) % (2**31),
+                    },
+                    out_root,
+                    cfg.min_mask_pixels,
+                )
+
     ok_count = 0
-
     aug_workers = max(1, min(cfg.aug_workers, cfg.workers))
     logger.info(f"Augmentation workers: {aug_workers}")
-    # Use forkserver so workers start clean instead of inheriting the
-    # parent's ~2-3 GB address space (306K Sample objects, etc.).
     mp_ctx = multiprocessing.get_context("forkserver")
     with open(manifest_path, "a") as manifest_f:
         with ProcessPoolExecutor(max_workers=aug_workers, mp_context=mp_ctx) as ex:
             for ok, _, result in tqdm(
-                ex.map(_augment_worker, iter(worker_args), chunksize=4),
+                ex.map(_augment_worker, _worker_args_iter(), chunksize=4),
                 total=total_tasks, desc="Augmenting",
             ):
                 if ok and result:
                     ok_count += 1
-                    sample = Sample(
-                        image_path=result["aug_img_path"],
-                        mask_path=result["aug_mask_path"],
-                        label_path=result["aug_label_path"],
-                        category=result["category"],
-                        base_name=result["base_name"],
-                        width=result["W"],
-                        height=result["H"],
-                        polygons=None,
-                    )
-                    aug_samples.append(sample)
-
                     rec = {
-                        "image_path": sample.image_path,
-                        "mask_path": sample.mask_path,
-                        "label_path": sample.label_path,
-                        "category": sample.category,
-                        "base_name": sample.base_name,
-                        "width": sample.width,
-                        "height": sample.height,
-                        "polygons": sample.polygons,
+                        "image_path": result["aug_img_path"],
+                        "mask_path":  result["aug_mask_path"],
+                        "label_path": result["aug_label_path"],
+                        "category":   result["category"],
+                        "base_name":  result["base_name"],
+                        "width":      result["W"],
+                        "height":     result["H"],
+                        "polygons":   None,
                     }
                     manifest_f.write(json.dumps(rec, separators=(",", ":")) + "\n")
                     manifest_f.flush()
 
-    report.augmented = len(aug_samples)
+    report.augmented = total_already_done + ok_count
     logger.info(
-        f"Augmentation done: +{ok_count:,} new / {len(to_augment):,} requested; "
-        f"total augmented available: {len(aug_samples):,}"
+        f"Augmentation done: +{ok_count:,} new / {total_tasks:,} requested; "
+        f"total: {report.augmented:,}"
     )
-    return aug_samples
 
 
 # ─────────────────────────── STEP 4: COCO BUILD ─────────────────────────────
@@ -1123,7 +1163,8 @@ def _assemble_coco_json(
 
 
 def write_coco_split_streaming(
-    samples: List[Sample],
+    sample_iter,                    # iterator of (img, label, cat, base, w, h, polygons)
+    total: int,                     # number of items (for tqdm)
     categories: List[Dict],
     cat_name_to_id: Dict[str, int],
     workers: int,
@@ -1132,39 +1173,34 @@ def write_coco_split_streaming(
 ) -> Tuple[int, int]:
     """
     Memory-safe COCO writer.
+    Consumes sample_iter one item at a time — no list ever held in RAM.
     Streams per-image and per-annotation records to JSONL temp files,
-    then assembles final COCO JSON without keeping huge lists in RAM.
+    then assembles final COCO JSON.
     Returns (num_images, num_annotations).
     """
-    def _coco_args_iter():
-        for s in samples:
-            yield (s.image_path, s.label_path, s.category, s.base_name,
-                   s.width, s.height, s.polygons)
-
     images_jsonl = f"{json_path}.images.jsonl"
-    anns_jsonl = f"{json_path}.anns.jsonl"
+    anns_jsonl   = f"{json_path}.anns.jsonl"
 
-    image_id = 1
-    ann_id = 1
+    image_id   = 1
+    ann_id     = 1
     num_images = 0
-    num_anns = 0
-    total = len(samples)
+    num_anns   = 0
 
     mp_ctx = multiprocessing.get_context("forkserver")
     with open(images_jsonl, "w") as img_f, open(anns_jsonl, "w") as ann_f:
         with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
             for result in tqdm(
-                ex.map(_build_coco_worker, _coco_args_iter(), chunksize=32),
+                ex.map(_build_coco_worker, sample_iter, chunksize=32),
                 total=total, desc=desc,
             ):
                 if result is None:
                     continue
 
                 img_rec = {
-                    "id": image_id,
+                    "id":       image_id,
                     "file_name": result["file_name"],
-                    "width": result["width"],
-                    "height": result["height"],
+                    "width":    result["width"],
+                    "height":   result["height"],
                     "category": result["category"],
                 }
                 img_f.write(_json_dumps_line(img_rec) + "\n")
@@ -1172,16 +1208,16 @@ def write_coco_split_streaming(
 
                 for ann in result["annotations"]:
                     ann_rec = {
-                        "id": ann_id,
-                        "image_id": image_id,
-                        "category_id": cat_name_to_id[ann["category_name"]],
+                        "id":           ann_id,
+                        "image_id":     image_id,
+                        "category_id":  cat_name_to_id[ann["category_name"]],
                         "segmentation": ann["segmentation"],
-                        "bbox": ann["bbox"],
-                        "area": ann["area"],
-                        "iscrowd": 0,
+                        "bbox":         ann["bbox"],
+                        "area":         ann["area"],
+                        "iscrowd":      0,
                     }
                     ann_f.write(_json_dumps_line(ann_rec) + "\n")
-                    ann_id += 1
+                    ann_id   += 1
                     num_anns += 1
 
                 image_id += 1
@@ -1210,106 +1246,124 @@ def _copy_image_worker(args) -> bool:
 
 
 def build_dataset(
-    all_samples: List[Sample],
+    valid_cache_path: str,
+    aug_manifest_path: Optional[str],
     output_dir: str,
     cfg: Config,
     logger: logging.Logger,
     report: PipelineReport,
 ):
     """
-    Main COCO dataset builder:
-      1. Build category → ID mapping (sorted, stable)
-      2. Stratified 80/20 split
-      3. Copy images into images/train|val/<category>/
-      4. Build COCO JSON in parallel → annotations/instances_train|val.json
+    Main COCO dataset builder — fully streaming, never holds all samples in RAM.
+
+    Data flow (all via _stream_jsonl_samples — one record at a time):
+      Pass 1 : collect {category: [(base_name, is_aug)]} — ~30 MB of strings
+      Compute : stratified split → val_set (set of (cat, base_name) tuples, ~7 MB)
+      Pass 2 : stream → copy images
+      Pass 3 : stream → COCO train annotations
+      Pass 4 : stream → COCO val annotations
     """
     _release_memory()
-    logger.info(f"Building COCO dataset from {len(all_samples):,} samples ...")
+    logger.info("Building COCO dataset (streaming from cache files) ...")
     random.seed(cfg.seed)
 
-    # ── 1. Category → ID mapping (1-indexed, sorted for stability) ───────
-    all_cats = sorted(set(s.category for s in all_samples))
+    has_aug = bool(aug_manifest_path and os.path.exists(aug_manifest_path))
+
+    # ── Pass 1: lightweight string-only index for stratified split ────────
+    # Store only (base_name, is_aug) per category — NOT Sample objects.
+    by_cat: Dict[str, List[Tuple[str, bool]]] = defaultdict(list)
+    for _, _, _, cat, base, _, _, _ in _stream_jsonl_samples(valid_cache_path):
+        by_cat[cat].append((base, False))
+    if has_aug:
+        for _, _, _, cat, base, _, _, _ in _stream_jsonl_samples(aug_manifest_path):
+            by_cat[cat].append((base, True))
+
+    all_cats       = sorted(by_cat.keys())
     cat_name_to_id = {name: idx + 1 for idx, name in enumerate(all_cats)}
-    categories = [{"id": cat_name_to_id[name], "name": name, "supercategory": "fashion"}
-                  for name in all_cats]
+    categories     = [{"id": cat_name_to_id[n], "name": n, "supercategory": "fashion"}
+                      for n in all_cats]
     logger.info(f"Categories: {len(all_cats)}")
 
-    # ── 2. Stratified split ───────────────────────────────────────────────
-    by_cat: Dict[str, List[Sample]] = defaultdict(list)
-    for s in all_samples:
-        by_cat[s.category].append(s)
+    val_set:     Set[Tuple[str, str]] = set()
+    total_count = 0
+    for cat, entries in by_cat.items():
+        shuffled = entries[:]
+        random.shuffle(shuffled)
+        n_val = max(1, int(len(shuffled) * cfg.val_split))
+        for base, _ in shuffled[:n_val]:
+            val_set.add((cat, base))
+        report.by_category[cat] = len(entries)
+        total_count += len(entries)
 
-    train_samples: List[Sample] = []
-    val_samples:   List[Sample] = []
-    for cat in sorted(by_cat.keys()):
-        cat_list = by_cat[cat][:]
-        random.shuffle(cat_list)
-        n_val = max(1, int(len(cat_list) * cfg.val_split))
-        val_samples.extend(cat_list[:n_val])
-        train_samples.extend(cat_list[n_val:])
-        report.by_category[cat] = len(cat_list)
-
-    # Free the intermediate structures
-    del by_cat, all_samples
+    del by_cat
     _release_memory()
 
-    report.train_count = len(train_samples)
-    report.val_count   = len(val_samples)
-    logger.info(f"Split: {len(train_samples):,} train | {len(val_samples):,} val")
+    total_val   = len(val_set)
+    total_train = total_count - total_val
+    report.train_count = total_train
+    report.val_count   = total_val
+    logger.info(f"Split: {total_train:,} train | {total_val:,} val")
 
-    # ── 3. Copy images — use hardlinks, stream in batches ─────────────
-    # Pre-create directories first, then stream copy tasks through executor
-    # to avoid materialising the full list in memory.
-    dirs_needed: Set[str] = set()
-    total_copy = len(train_samples) + len(val_samples)
-    # Build dirs set (cheap — just strings)
-    for split, split_samples in [("train", train_samples), ("val", val_samples)]:
-        for s in split_samples:
-            dirs_needed.add(
-                os.path.join(output_dir, "images", split, s.category)
-            )
-    for d in dirs_needed:
-        os.makedirs(d, exist_ok=True)
-    del dirs_needed
+    # ── Pre-create output directories (97 cats × 2 splits = 194 dirs) ────
+    for split in ("train", "val"):
+        for cat in all_cats:
+            os.makedirs(os.path.join(output_dir, "images", split, cat), exist_ok=True)
 
-    def _copy_task_iter():
-        for split, split_samples in [("train", train_samples), ("val", val_samples)]:
-            for s in split_samples:
-                ext = Path(s.image_path).suffix
-                img_dst = os.path.join(output_dir, "images", split,
-                                       s.category, f"{s.base_name}{ext}")
-                yield (s.image_path, img_dst)
+    # ── Helper: unified stream across both source files ───────────────────
+    def _all_records():
+        yield from _stream_jsonl_samples(valid_cache_path)
+        if has_aug:
+            yield from _stream_jsonl_samples(aug_manifest_path)
+
+    # ── Pass 2: copy images (hardlink where possible) ─────────────────────
+    def _copy_arg_iter():
+        for img, _, _, cat, base, _, _, _ in _all_records():
+            split = "val" if (cat, base) in val_set else "train"
+            ext   = Path(img).suffix
+            dst   = os.path.join(output_dir, "images", split, cat, f"{base}{ext}")
+            yield (img, dst)
 
     mp_ctx = multiprocessing.get_context("forkserver")
     ok = 0
     with ProcessPoolExecutor(max_workers=cfg.workers, mp_context=mp_ctx) as ex:
         for success in tqdm(
-            ex.map(_copy_image_worker, _copy_task_iter(), chunksize=128),
-            total=total_copy, desc="Copying images",
+            ex.map(_copy_image_worker, _copy_arg_iter(), chunksize=128),
+            total=total_count, desc="Copying images",
         ):
             if success:
                 ok += 1
-    logger.info(f"Copied {ok:,}/{total_copy:,} images")
+    logger.info(f"Copied {ok:,}/{total_count:,} images")
     _release_memory()
 
-    # ── 4. Build COCO JSONs ───────────────────────────────────────────────
+    # ── Pass 3 + 4: COCO annotation JSONs ────────────────────────────────
     ann_dir = os.path.join(output_dir, "annotations")
     os.makedirs(ann_dir, exist_ok=True)
 
     coco_workers = max(1, min(cfg.coco_workers, cfg.workers))
     logger.info(f"COCO workers: {coco_workers}")
-    for split, split_samples in [("train", train_samples), ("val", val_samples)]:
-        logger.info(f"Building COCO annotations for {split} ({len(split_samples):,} samples) ...")
-        json_path = os.path.join(ann_dir, f"instances_{split}.json")
+
+    for split in ("train", "val"):
+        is_val   = (split == "val")
+        n_split  = total_val if is_val else total_train
+        json_out = os.path.join(ann_dir, f"instances_{split}.json")
+        logger.info(f"Building COCO annotations for {split} ({n_split:,} samples) ...")
+
+        # Generator: yields 7-tuples matching _build_coco_worker's arg order
+        def _split_iter(split_is_val=is_val):
+            for img, _, label, cat, base, w, h, poly in _all_records():
+                if ((cat, base) in val_set) == split_is_val:
+                    yield (img, label, cat, base, w, h, poly)
+
         n_imgs, n_anns = write_coco_split_streaming(
-            split_samples,
-            categories,
-            cat_name_to_id,
-            workers=coco_workers,
-            json_path=json_path,
-            desc=f"COCO {split}",
+            sample_iter    = _split_iter(),
+            total          = n_split,
+            categories     = categories,
+            cat_name_to_id = cat_name_to_id,
+            workers        = coco_workers,
+            json_path      = json_out,
+            desc           = f"COCO {split}",
         )
-        logger.info(f"  ↳ {json_path}  |  {n_imgs:,} images  |  {n_anns:,} annotations")
+        logger.info(f"  ↳ {json_out}  |  {n_imgs:,} images  |  {n_anns:,} annotations")
         _release_memory()
 
 
@@ -1391,24 +1445,25 @@ def main():
 
     # ── 1 & 2. Discover + Validate (or load cache on resume) ─────────────
     valid_cache_path = os.path.join(cfg.output_dir, "_valid_samples_cache.jsonl")
-    valid_samples: Optional[List[Sample]] = None
+    using_cache = False
 
-    if args.resume:
-        cached, cached_report = _load_valid_samples_cache(valid_cache_path, logger)
-        if cached:
-            valid_samples = cached
-            # Restore report counters from cache
-            if cached_report:
-                report.total_found = cached_report.get("total_found", 0)
-                report.valid = cached_report.get("valid", 0)
-                report.removed_missing = cached_report.get("removed_missing", 0)
-                report.removed_corrupted = cached_report.get("removed_corrupted", 0)
-                report.removed_small_mask = cached_report.get("removed_small_mask", 0)
-                report.removed_invalid_label = cached_report.get("removed_invalid_label", 0)
+    if args.resume and os.path.exists(valid_cache_path):
+        cached_report = _read_cache_header(valid_cache_path, logger)
+        if cached_report:
+            report.total_found          = cached_report.get("total_found", 0)
+            report.valid                = cached_report.get("valid", 0)
+            report.removed_missing      = cached_report.get("removed_missing", 0)
+            report.removed_corrupted    = cached_report.get("removed_corrupted", 0)
+            report.removed_small_mask   = cached_report.get("removed_small_mask", 0)
+            report.removed_invalid_label = cached_report.get("removed_invalid_label", 0)
             completed_stages = 2
-            logger.info(f"[Stage 1-2/6] Loaded {len(valid_samples):,} validated samples from cache (skipped discovery+validation)")
+            logger.info(
+                f"[Stage 1-2/6] Using validation cache "
+                f"({report.valid:,} samples — skipped discovery+validation)"
+            )
+            using_cache = True
 
-    if valid_samples is None:
+    if not using_cache:
         t_stage = time.time()
         samples = discover_samples(cfg.input_dir, logger)
         if not samples:
@@ -1430,11 +1485,10 @@ def main():
             sys.exit(1)
         _stage_done("Validation", t_stage)
 
-        # Save cache for future resume runs
+        # Save cache, then free immediately — everything downstream streams
         _save_valid_samples_cache(valid_samples, valid_cache_path, report, logger)
-
-        del samples
-        gc.collect()
+        del valid_samples, samples
+        _release_memory()
 
     if args.dry_run:
         logger.info("Dry run complete. No files copied.")
@@ -1443,33 +1497,31 @@ def main():
         logger.info(f"Report saved: {report_path}")
         return
 
-    # ── 3. Augment ────────────────────────────────────────────────────────
+    # ── 3. Augment (streams from cache file — no sample list in RAM) ──────
     t_stage = time.time()
-    aug_samples: List[Sample] = []
+    aug_manifest_path = os.path.join(cfg.output_dir, "_augmented_manifest.jsonl")
     if not args.no_aug:
         aug_temp = os.path.join(cfg.output_dir, "_augmented_temp")
-        aug_samples = augment_samples(valid_samples, cfg, aug_temp, logger, report, resume=args.resume)
+        augment_samples(valid_cache_path, cfg, aug_temp, logger, report, resume=args.resume)
     else:
         logger.info("Augmentation skipped (--no-aug)")
     _stage_done("Augmentation", t_stage)
 
-    # ── 4. Build COCO dataset ─────────────────────────────────────────────
+    # ── 4. Build COCO dataset (streams from cache + manifest — no lists) ──
     t_stage = time.time()
-    all_samples = valid_samples + aug_samples
-    # Free the separate lists — build_dataset only needs all_samples
-    del valid_samples, aug_samples
     _release_memory()
-    logger.info(f"Memory released before COCO build (RSS will drop after malloc_trim)")
-    build_dataset(all_samples, cfg.output_dir, cfg, logger, report)
-    del all_samples
+    build_dataset(
+        valid_cache_path,
+        aug_manifest_path if (not args.no_aug and os.path.exists(aug_manifest_path)) else None,
+        cfg.output_dir, cfg, logger, report,
+    )
     _release_memory()
     _stage_done("COCO Build", t_stage)
 
     # ── 5. Cleanup temp files (only after COCO build succeeded) ────────────
     t_stage = time.time()
     aug_temp = os.path.join(cfg.output_dir, "_augmented_temp")
-    aug_manifest = os.path.join(cfg.output_dir, "_augmented_manifest.jsonl")
-    for tmp_path in [aug_temp, aug_manifest, valid_cache_path]:
+    for tmp_path in [aug_temp, aug_manifest_path, valid_cache_path]:
         if os.path.isdir(tmp_path):
             shutil.rmtree(tmp_path, ignore_errors=True)
             logger.info(f"Cleaned up {os.path.basename(tmp_path)}")
