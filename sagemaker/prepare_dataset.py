@@ -46,6 +46,7 @@ import argparse
 import random
 import time
 import inspect
+import gc
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
@@ -55,6 +56,10 @@ from typing import List, Tuple, Optional, Dict, Set
 import cv2
 import numpy as np
 from tqdm import tqdm
+
+# Keep OpenCV from spawning large thread pools in each worker process.
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
 
 # ── Fast JSON writer (3-5× faster than stdlib for large COCO files) ──────────
 try:
@@ -82,6 +87,7 @@ class Config:
 
     workers: int = 4                 # parallel workers
     aug_workers: int = 2             # separate workers for augmentation (memory heavy)
+    coco_workers: int = 1            # COCO annotation workers (streamed writer still CPU-heavy)
     min_mask_area_ratio: float = 0.002
     min_mask_pixels: int = 500
     min_polygon_points: int = 3
@@ -166,6 +172,41 @@ def setup_logging(output_dir: str) -> logging.Logger:
     logger.addHandler(fh)
     logger.addHandler(ch)
     return logger
+
+
+def _load_augmented_manifest(manifest_path: str, logger: logging.Logger) -> List[Sample]:
+    """Load augmented samples saved from a previous run."""
+    samples: List[Sample] = []
+    if not os.path.exists(manifest_path):
+        return samples
+
+    try:
+        with open(manifest_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                img_path = rec.get("image_path", "")
+                mask_path = rec.get("mask_path", "")
+                if not (img_path and mask_path and os.path.exists(img_path) and os.path.exists(mask_path)):
+                    continue
+                samples.append(Sample(
+                    image_path=img_path,
+                    mask_path=mask_path,
+                    label_path=rec.get("label_path", ""),
+                    category=rec["category"],
+                    base_name=rec["base_name"],
+                    width=int(rec.get("width", 0)),
+                    height=int(rec.get("height", 0)),
+                    polygons=rec.get("polygons"),
+                ))
+    except Exception as e:
+        logger.warning(f"Could not load augmentation manifest {manifest_path}: {e}")
+        return []
+
+    logger.info(f"Loaded {len(samples):,} augmented samples from manifest")
+    return samples
 
 
 # ─────────────────────────── STEP 1: DISCOVER ───────────────────────────────
@@ -742,6 +783,7 @@ def augment_samples(
     out_root: str,
     logger: logging.Logger,
     report: PipelineReport,
+    resume: bool = False,
 ) -> List[Sample]:
     """Stratified selection + parallel augmentation. Returns new Sample list."""
     if not HAS_ALBUMENTATIONS:
@@ -753,48 +795,90 @@ def augment_samples(
     for s in valid_samples:
         by_cat[s.category].append(s)
 
+    manifest_path = os.path.join(os.path.dirname(out_root), "_augmented_manifest.jsonl")
+    existing_aug_samples: List[Sample] = []
+    done_source_keys: Set[Tuple[str, str]] = set()
+
+    if resume and os.path.exists(manifest_path):
+        existing_aug_samples = _load_augmented_manifest(manifest_path, logger)
+        # Manifest uses aug_ prefixed base_name; map back to original source base.
+        for s in existing_aug_samples:
+            src_base = s.base_name[4:] if s.base_name.startswith("aug_") else s.base_name
+            done_source_keys.add((s.category, src_base))
+        if done_source_keys:
+            logger.info(f"Resume mode: {len(done_source_keys):,} augmentation items already completed")
+
     to_augment: List[Sample] = []
     for cat, cat_samples in by_cat.items():
         n = max(1, int(len(cat_samples) * cfg.aug_ratio))
-        to_augment.extend(random.sample(cat_samples, min(n, len(cat_samples))))
+        selected = random.sample(cat_samples, min(n, len(cat_samples)))
+        if done_source_keys:
+            selected = [s for s in selected if (s.category, s.base_name) not in done_source_keys]
+        to_augment.extend(selected)
 
     logger.info(f"Augmenting {len(to_augment):,} samples "
                 f"({cfg.aug_ratio * 100:.0f}% per category) using albumentations keypoint API ...")
 
-    worker_args = [
-        ({"image_path": s.image_path, "mask_path": s.mask_path,
-          "label_path": s.label_path, "category": s.category,
-          "base_name": s.base_name,
-          "aug_seed": cfg.seed + hash(s.base_name) % (2**31)},
-         out_root, cfg.min_mask_pixels)
-        for s in to_augment
-    ]
+    total_tasks = len(to_augment)
 
-    aug_samples: List[Sample] = []
+    def _worker_args_iter():
+        for s in to_augment:
+            yield (
+                {
+                    "image_path": s.image_path,
+                    "mask_path": s.mask_path,
+                    "label_path": s.label_path,
+                    "category": s.category,
+                    "base_name": s.base_name,
+                    "aug_seed": cfg.seed + hash(s.base_name) % (2**31),
+                },
+                out_root,
+                cfg.min_mask_pixels,
+            )
+
+    aug_samples: List[Sample] = existing_aug_samples[:]
     ok_count = 0
 
     aug_workers = max(1, min(cfg.aug_workers, cfg.workers))
     logger.info(f"Augmentation workers: {aug_workers}")
-    with ProcessPoolExecutor(max_workers=aug_workers) as ex:
-        for ok, _, result in tqdm(
-            ex.map(_augment_worker, worker_args, chunksize=16),
-            total=len(worker_args), desc="Augmenting",
-        ):
-            if ok and result:
-                ok_count += 1
-                aug_samples.append(Sample(
-                    image_path=result["aug_img_path"],
-                    mask_path=result["aug_mask_path"],
-                    label_path="",
-                    category=result["category"],
-                    base_name=result["base_name"],
-                    width=result["W"],
-                    height=result["H"],
-                    polygons=result["polygons"],   # carry augmented polygons forward
-                ))
+    with open(manifest_path, "a") as manifest_f:
+        with ProcessPoolExecutor(max_workers=aug_workers) as ex:
+            for ok, _, result in tqdm(
+                ex.map(_augment_worker, _worker_args_iter(), chunksize=16),
+                total=total_tasks, desc="Augmenting",
+            ):
+                if ok and result:
+                    ok_count += 1
+                    sample = Sample(
+                        image_path=result["aug_img_path"],
+                        mask_path=result["aug_mask_path"],
+                        label_path="",
+                        category=result["category"],
+                        base_name=result["base_name"],
+                        width=result["W"],
+                        height=result["H"],
+                        polygons=result["polygons"],   # carry augmented polygons forward
+                    )
+                    aug_samples.append(sample)
 
-    report.augmented = ok_count
-    logger.info(f"Augmentation done: {ok_count:,} / {len(to_augment):,} succeeded")
+                    rec = {
+                        "image_path": sample.image_path,
+                        "mask_path": sample.mask_path,
+                        "label_path": sample.label_path,
+                        "category": sample.category,
+                        "base_name": sample.base_name,
+                        "width": sample.width,
+                        "height": sample.height,
+                        "polygons": sample.polygons,
+                    }
+                    manifest_f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                    manifest_f.flush()
+
+    report.augmented = len(aug_samples)
+    logger.info(
+        f"Augmentation done: +{ok_count:,} new / {len(to_augment):,} requested; "
+        f"total augmented available: {len(aug_samples):,}"
+    )
     return aug_samples
 
 
@@ -866,69 +950,127 @@ def _make_coco_timestamp() -> str:
     return datetime.datetime.utcnow().strftime("%Y/%m/%d")
 
 
-def convert_to_coco(
+def _json_dumps_line(obj: dict) -> str:
+    """Compact JSON line serializer (uses orjson when available)."""
+    if HAS_ORJSON:
+        return orjson.dumps(obj, option=orjson.OPT_SERIALIZE_NUMPY).decode("utf-8")
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def _assemble_coco_json(
+    json_path: str,
+    images_jsonl: str,
+    anns_jsonl: str,
+    categories: List[Dict],
+):
+    """Assemble final COCO JSON from streamed image/annotation JSONL files."""
+    with open(json_path, "w") as out:
+        out.write("{")
+        out.write('"info":')
+        out.write(_json_dumps_line({
+            "description": "Fashion Instance Segmentation Dataset",
+            "date_created": _make_coco_timestamp(),
+            "version": "1.0",
+        }))
+        out.write(',"licenses":[]')
+        out.write(',"categories":')
+        out.write(_json_dumps_line(categories))
+
+        out.write(',"images":[')
+        first = True
+        with open(images_jsonl, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if not first:
+                    out.write(",")
+                out.write(line)
+                first = False
+        out.write("]")
+
+        out.write(',"annotations":[')
+        first = True
+        with open(anns_jsonl, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if not first:
+                    out.write(",")
+                out.write(line)
+                first = False
+        out.write("]")
+        out.write("}\n")
+
+
+def write_coco_split_streaming(
     samples: List[Sample],
     categories: List[Dict],
     cat_name_to_id: Dict[str, int],
     workers: int,
+    json_path: str,
     desc: str,
-) -> dict:
+) -> Tuple[int, int]:
     """
-    Parallel COCO annotation builder.
-    Returns a COCO-format dict (images + annotations lists).
+    Memory-safe COCO writer.
+    Streams per-image and per-annotation records to JSONL temp files,
+    then assembles final COCO JSON without keeping huge lists in RAM.
+    Returns (num_images, num_annotations).
     """
-    coco_images:      List[dict] = []
-    coco_annotations: List[dict] = []
-    image_id    = 1
-    ann_id      = 1
-
     worker_args = [
         (s.image_path, s.label_path, s.category, s.base_name,
          s.width, s.height, s.polygons)
         for s in samples
     ]
 
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        for result in tqdm(
-            ex.map(_build_coco_worker, worker_args, chunksize=64),
-            total=len(worker_args), desc=desc,
-        ):
-            if result is None:
-                continue
+    images_jsonl = f"{json_path}.images.jsonl"
+    anns_jsonl = f"{json_path}.anns.jsonl"
 
-            coco_images.append({
-                "id":        image_id,
-                "file_name": result["file_name"],
-                "width":     result["width"],
-                "height":    result["height"],
-                "category":  result["category"],   # extra field for debugging
-            })
+    image_id = 1
+    ann_id = 1
+    num_images = 0
+    num_anns = 0
 
-            for ann in result["annotations"]:
-                coco_annotations.append({
-                    "id":           ann_id,
-                    "image_id":     image_id,
-                    "category_id":  cat_name_to_id[ann["category_name"]],
-                    "segmentation": ann["segmentation"],
-                    "bbox":         ann["bbox"],
-                    "area":         ann["area"],
-                    "iscrowd":      0,
-                })
-                ann_id += 1
+    with open(images_jsonl, "w") as img_f, open(anns_jsonl, "w") as ann_f:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for result in tqdm(
+                ex.map(_build_coco_worker, worker_args, chunksize=64),
+                total=len(worker_args), desc=desc,
+            ):
+                if result is None:
+                    continue
 
-            image_id += 1
+                img_rec = {
+                    "id": image_id,
+                    "file_name": result["file_name"],
+                    "width": result["width"],
+                    "height": result["height"],
+                    "category": result["category"],
+                }
+                img_f.write(_json_dumps_line(img_rec) + "\n")
+                num_images += 1
 
-    return {
-        "info": {
-            "description":  "Fashion Instance Segmentation Dataset",
-            "date_created": _make_coco_timestamp(),
-            "version":      "1.0",
-        },
-        "licenses": [],
-        "categories": categories,
-        "images":     coco_images,
-        "annotations": coco_annotations,
-    }
+                for ann in result["annotations"]:
+                    ann_rec = {
+                        "id": ann_id,
+                        "image_id": image_id,
+                        "category_id": cat_name_to_id[ann["category_name"]],
+                        "segmentation": ann["segmentation"],
+                        "bbox": ann["bbox"],
+                        "area": ann["area"],
+                        "iscrowd": 0,
+                    }
+                    ann_f.write(_json_dumps_line(ann_rec) + "\n")
+                    ann_id += 1
+                    num_anns += 1
+
+                image_id += 1
+
+    _assemble_coco_json(json_path, images_jsonl, anns_jsonl, categories)
+    os.remove(images_jsonl)
+    os.remove(anns_jsonl)
+    return num_images, num_anns
 
 
 def _copy_image_worker(args) -> bool:
@@ -1019,22 +1161,19 @@ def build_dataset(
     ann_dir = os.path.join(output_dir, "annotations")
     os.makedirs(ann_dir, exist_ok=True)
 
+    coco_workers = max(1, min(cfg.coco_workers, cfg.workers))
+    logger.info(f"COCO workers: {coco_workers}")
     for split, split_samples in [("train", train_samples), ("val", val_samples)]:
         logger.info(f"Building COCO annotations for {split} ({len(split_samples):,} samples) ...")
-        coco_dict = convert_to_coco(
-            split_samples, categories, cat_name_to_id,
-            workers=cfg.workers,
+        json_path = os.path.join(ann_dir, f"instances_{split}.json")
+        n_imgs, n_anns = write_coco_split_streaming(
+            split_samples,
+            categories,
+            cat_name_to_id,
+            workers=coco_workers,
+            json_path=json_path,
             desc=f"COCO {split}",
         )
-        json_path = os.path.join(ann_dir, f"instances_{split}.json")
-        if HAS_ORJSON:
-            with open(json_path, "wb") as f:
-                f.write(orjson.dumps(coco_dict, option=orjson.OPT_SERIALIZE_NUMPY))
-        else:
-            with open(json_path, "w") as f:
-                json.dump(coco_dict, f)   # no indent for large files (saves ~30% size)
-        n_imgs = len(coco_dict["images"])
-        n_anns = len(coco_dict["annotations"])
         logger.info(f"  ↳ {json_path}  |  {n_imgs:,} images  |  {n_anns:,} annotations")
 
 
@@ -1057,6 +1196,8 @@ def parse_args():
                    help="Parallel workers (match CPU core count)")
     p.add_argument("--aug-workers",     type=int,   default=2,
                    help="Workers for augmentation stage (lower saves RAM)")
+    p.add_argument("--coco-workers",    type=int,   default=1,
+                   help="Workers for COCO annotation build stage")
     p.add_argument("--min-mask-ratio",  type=float, default=0.002,
                    help="Min mask area / image area")
     p.add_argument("--min-mask-pixels", type=int,   default=500,
@@ -1067,6 +1208,8 @@ def parse_args():
                    help="Limit total samples (for debugging; 0 = no limit)")
     p.add_argument("--dry-run",         action="store_true",
                    help="Run discovery + validation only, no copy/build")
+    p.add_argument("--resume",          action="store_true",
+                   help="Resume from existing augmentation manifest when available")
     p.add_argument("--seed",            type=int,   default=42)
     return p.parse_args()
 
@@ -1080,6 +1223,7 @@ def main():
         val_split=args.val_split,
         workers=args.workers,
         aug_workers=args.aug_workers,
+        coco_workers=args.coco_workers,
         min_mask_area_ratio=args.min_mask_ratio,
         min_mask_pixels=args.min_mask_pixels,
         seed=args.seed,
@@ -1096,7 +1240,7 @@ def main():
     logger.info(f"Input  : {cfg.input_dir}")
     logger.info(f"Output : {cfg.output_dir}")
     logger.info(
-        f"Workers: {cfg.workers}  |  Aug workers: {cfg.aug_workers}  |  "
+        f"Workers: {cfg.workers}  |  Aug workers: {cfg.aug_workers}  |  COCO workers: {cfg.coco_workers}  |  "
         f"Aug: {cfg.aug_ratio}  |  Val: {cfg.val_split}"
     )
 
@@ -1132,6 +1276,10 @@ def main():
         sys.exit(1)
     _stage_done("Validation", t_stage)
 
+    # Release discovery list before memory-heavy augmentation stage.
+    del samples
+    gc.collect()
+
     if args.dry_run:
         logger.info("Dry run complete. No files copied.")
         report_path = os.path.join(cfg.output_dir, "pipeline_report.json")
@@ -1144,7 +1292,7 @@ def main():
     aug_samples: List[Sample] = []
     if not args.no_aug:
         aug_temp = os.path.join(cfg.output_dir, "_augmented_temp")
-        aug_samples = augment_samples(valid_samples, cfg, aug_temp, logger, report)
+        aug_samples = augment_samples(valid_samples, cfg, aug_temp, logger, report, resume=args.resume)
     else:
         logger.info("Augmentation skipped (--no-aug)")
     _stage_done("Augmentation", t_stage)
@@ -1158,9 +1306,13 @@ def main():
     # ── 5. Cleanup augmentation temp dir ──────────────────────────────────
     t_stage = time.time()
     aug_temp = os.path.join(cfg.output_dir, "_augmented_temp")
+    aug_manifest = os.path.join(cfg.output_dir, "_augmented_manifest.jsonl")
     if os.path.isdir(aug_temp):
         shutil.rmtree(aug_temp, ignore_errors=True)
         logger.info("Cleaned up _augmented_temp")
+    if os.path.exists(aug_manifest):
+        os.remove(aug_manifest)
+        logger.info("Cleaned up _augmented_manifest.jsonl")
     _stage_done("Cleanup", t_stage)
 
     # ── 6. Report ─────────────────────────────────────────────────────────
