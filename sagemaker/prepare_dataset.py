@@ -1274,8 +1274,12 @@ def write_coco_split_streaming(
 
 
 def _copy_image_worker(args) -> bool:
-    """Link image into output tree — symlink (zero space), hardlink, or copy."""
-    img_src, img_dst = args
+    """Link/copy image into output tree. Augmented-temp sources are materialized."""
+    if len(args) == 3:
+        img_src, img_dst, allow_symlink = args
+    else:
+        img_src, img_dst = args
+        allow_symlink = True
     try:
         if not os.path.exists(img_src):
             return False
@@ -1285,13 +1289,19 @@ def _copy_image_worker(args) -> bool:
         dst_dir = os.path.dirname(img_dst)
         if not os.path.isdir(dst_dir):
             os.makedirs(dst_dir, exist_ok=True)
-        try:
-            os.symlink(os.path.abspath(img_src), img_dst)  # symlink = zero disk space
-        except (OSError, PermissionError):
+        if allow_symlink:
             try:
-                os.link(img_src, img_dst)                  # hardlink = shares inode
+                os.symlink(os.path.abspath(img_src), img_dst)  # symlink = zero disk space
             except (OSError, PermissionError):
-                shutil.copy2(img_src, img_dst)             # copy = last resort
+                try:
+                    os.link(img_src, img_dst)                  # hardlink = shares inode
+                except (OSError, PermissionError):
+                    shutil.copy2(img_src, img_dst)             # copy = last resort
+        else:
+            try:
+                os.link(img_src, img_dst)                      # prefer hardlink if same FS
+            except (OSError, PermissionError):
+                shutil.copy2(img_src, img_dst)                 # materialize physical file
         return True
     except Exception:
         return False
@@ -1369,11 +1379,15 @@ def build_dataset(
 
     # ── Pass 2: copy images (hardlink where possible) ─────────────────────
     def _copy_arg_iter():
+        aug_temp_prefix = os.path.join(output_dir, "_augmented_temp") + os.sep
         for img, _, _, cat, base, _, _, _ in _all_records():
             split = "val" if (cat, base) in val_set else "train"
             ext   = Path(img).suffix
             dst   = os.path.join(output_dir, "images", split, cat, f"{base}{ext}")
-            yield (img, dst)
+            # Augmented samples live under _augmented_temp; they must be copied as
+            # physical files because cleanup removes that temp directory afterward.
+            allow_symlink = not os.path.abspath(img).startswith(aug_temp_prefix)
+            yield (img, dst, allow_symlink)
 
     mp_ctx = multiprocessing.get_context("forkserver")
     ok = 0
